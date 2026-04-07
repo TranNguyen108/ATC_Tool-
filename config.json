@@ -1,0 +1,25 @@
+{
+  "profiles": [
+    {
+      "name": "keyword one",
+      "email": "user1@gmail.com",
+      "host": "https://yoursite.com",
+      "target": 10,
+      "comments": [
+        "Great article about keyword one, really helpful!",
+        "I learned a lot about keyword one from this post.",
+        "Thanks for sharing this info on keyword one."
+      ]
+    },
+    {
+      "name": "keyword two",
+      "email": "user2@gmail.com",
+      "host": "https://yoursite2.com",
+      "target": 5,
+      "comments": [
+        "keyword two is exactly what I was looking for!",
+        "Very detailed guide on keyword two, thanks!"
+      ]
+    }
+  ]
+}
