@@ -12,12 +12,42 @@ async def random_pause(min_s: float = 0.5, max_s: float = 2.0) -> None:
     await asyncio.sleep(random.uniform(min_s, max_s))
 
 
-async def fast_fill(locator, text: str) -> None:
+async def mouse_approach(page, locator) -> None:
+    """Di chuyển chuột đến gần element + dispatch mouseenter/mouseover.
+    Thêm ~50-80ms, giúp Akismet thấy có mouse activity."""
+    try:
+        box = await locator.bounding_box(timeout=1500)
+        if not box:
+            return
+        # Target: center of element with small random offset
+        tx = box["x"] + box["width"] * random.uniform(0.3, 0.7)
+        ty = box["y"] + box["height"] * random.uniform(0.3, 0.7)
+        await page.mouse.move(tx, ty, steps=random.randint(2, 4))
+        await locator.dispatch_event("mouseenter", timeout=500)
+        await locator.dispatch_event("mouseover", timeout=500)
+    except Exception:
+        pass
+
+
+async def emit_form_signals(page, form_locator) -> None:
+    """Dispatch focusin + mouseover on form container — mimic real user focus.
+    Called once after form detection, adds ~50-100ms."""
+    try:
+        await form_locator.dispatch_event("mouseover", timeout=500)
+        await form_locator.dispatch_event("focusin", timeout=500)
+    except Exception:
+        pass
+    await asyncio.sleep(random.uniform(0.05, 0.1))
+
+
+async def fast_fill(locator, text: str, page=None) -> None:
     """
     Điền text instant qua fill() — dùng cho name/email/url (không cần slow-type).
     Mỗi Playwright call có timeout riêng để fail SẠCH nếu element bị vấn đề.
     Không dùng asyncio.wait_for bên ngoài — tránh cancel coroutine → orphaned future.
     """
+    if page:
+        await mouse_approach(page, locator)
     try:
         await locator.evaluate("el => el.scrollIntoView({behavior: 'instant', block: 'center'})")
     except Exception:
@@ -43,7 +73,7 @@ async def fast_fill(locator, text: str) -> None:
     await asyncio.sleep(random.uniform(0.08, 0.18))
 
 
-async def type_text(locator, text: str) -> None:
+async def type_text(locator, text: str, page=None) -> None:
     """
     Điền comment theo chunks (3-5 đoạn).
 
@@ -53,6 +83,8 @@ async def type_text(locator, text: str) -> None:
     Chunk fill mới: chia text thành 3-5 phần → 3-5 call fill() = ~1-2s total
       → Ít call = ít treo, vẫn không instant (tránh "nhập quá nhanh")
     """
+    if page:
+        await mouse_approach(page, locator)
     try:
         await locator.evaluate("el => el.scrollIntoView({behavior: 'instant', block: 'center'})")
     except Exception:

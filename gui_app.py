@@ -60,6 +60,10 @@ class GuiApp:
         self._key_rows: list[dict] = []
         self._urls_list: list[str] = []
 
+        # Multi-group data
+        self._groups: list[dict] = []          # [{"name": str, "profiles": list[dict]}]
+        self._current_group_view: int = 0
+
         self._state_file = Path("gui_state.json")
 
         self.db = dbm.DBManager()
@@ -141,7 +145,7 @@ class GuiApp:
         # LEFT — scrollable profile cards
         left = ttk.Frame(self._tab1)
         left.grid(row=0, column=0, sticky="nsew", padx=(8, 4), pady=8)
-        left.rowconfigure(1, weight=1)
+        left.rowconfigure(2, weight=1)
         left.columnconfigure(0, weight=1)
 
         ttk.Label(left, text="Profiles",
@@ -149,11 +153,40 @@ class GuiApp:
                   font=("Segoe UI", 10, "bold")).grid(
             row=0, column=0, sticky="w", pady=(0, 4))
 
+        # ── Group bar ────────────────────────────────────────────
+        grp_bar = ttk.Frame(left)
+        grp_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+
+        self._group_combo = ttk.Combobox(
+            grp_bar, state="readonly", width=20)
+        self._group_combo.pack(side="left", padx=(0, 6))
+        self._group_combo.bind("<<ComboboxSelected>>", self._on_group_selected)
+
+        self._group_name_entry = ttk.Entry(grp_bar, width=15)
+        self._group_name_entry.pack(side="left", padx=(0, 2))
+        tk.Button(
+            grp_bar, text="Doi ten", font=("Segoe UI", 8),
+            bg=ENTRY_BG, fg=FG, relief="flat", padx=6, cursor="hand2",
+            command=self._rename_group,
+        ).pack(side="left", padx=(0, 6))
+
+        tk.Button(
+            grp_bar, text="+ Them Group", font=("Segoe UI", 8),
+            bg=ENTRY_BG, fg=HEADING_FG, relief="flat", padx=6, cursor="hand2",
+            command=self._add_new_group,
+        ).pack(side="left", padx=(0, 4))
+
+        tk.Button(
+            grp_bar, text="Xoa Group", font=("Segoe UI", 8),
+            bg=BTN_STOP, fg=BTN_FG, relief="flat", padx=6, cursor="hand2",
+            command=self._delete_group,
+        ).pack(side="left")
+
         canvas = tk.Canvas(left, bg=BG, highlightthickness=0)
         vsb    = ttk.Scrollbar(left, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
-        canvas.grid(row=1, column=0, sticky="nsew")
-        vsb.grid(   row=1, column=1, sticky="ns")
+        canvas.grid(row=2, column=0, sticky="nsew")
+        vsb.grid(   row=2, column=1, sticky="ns")
 
         self._cards_frame = ttk.Frame(canvas)
         _win = canvas.create_window((0, 0), window=self._cards_frame, anchor="nw")
@@ -176,7 +209,7 @@ class GuiApp:
             font=("Segoe UI", 9), bg=ENTRY_BG, fg=HEADING_FG,
             relief="flat", padx=10, pady=4, cursor="hand2",
             command=self._add_profile_card,
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         # RIGHT — URL list + options + controls
         right = ttk.Frame(self._tab1)
@@ -359,6 +392,106 @@ class GuiApp:
             rd["frame"].destroy()
             self._key_rows.remove(rd)
 
+    # ── Group management ───────────────────────────────────────────────────────
+
+    def _collect_current_profiles(self) -> list[dict]:
+        """Thu thap profiles tu cac card dang hien thi."""
+        profiles = []
+        for r in self._key_rows:
+            comments = [
+                ln for ln in r["txt_cmt"].get("1.0", "end-1c").splitlines()
+                if ln.strip()
+            ]
+            try:
+                target = int(r["target_var"].get())
+            except Exception:
+                target = 5
+            profiles.append({
+                "name":    r["name_var"].get(),
+                "email":   r["email_var"].get(),
+                "host":    r["host_var"].get(),
+                "target":  target,
+                "comments": comments,
+            })
+        return profiles
+
+    def _display_group(self, idx: int) -> None:
+        """Xoa card cu, hien thi profiles cua group[idx]."""
+        for rd in list(self._key_rows):
+            rd["frame"].destroy()
+        self._key_rows.clear()
+
+        if 0 <= idx < len(self._groups):
+            profs = self._groups[idx].get("profiles", [])
+            if profs:
+                for p in profs:
+                    self._add_profile_card(
+                        name=p.get("name", ""),
+                        email=p.get("email", ""),
+                        host=p.get("host", ""),
+                        target=p.get("target", 5),
+                        comments=p.get("comments", []),
+                    )
+            else:
+                self._add_profile_card()
+        else:
+            self._add_profile_card()
+
+        self._current_group_view = idx
+        self._refresh_group_combo()
+
+    def _switch_group(self, new_idx: int) -> None:
+        if new_idx == self._current_group_view:
+            return
+        if 0 <= self._current_group_view < len(self._groups):
+            self._groups[self._current_group_view]["profiles"] = self._collect_current_profiles()
+        self._display_group(new_idx)
+
+    def _on_group_selected(self, event=None) -> None:
+        idx = self._group_combo.current()
+        if idx >= 0:
+            self._switch_group(idx)
+
+    def _rename_group(self) -> None:
+        new_name = self._group_name_entry.get().strip()
+        if not new_name:
+            return
+        if 0 <= self._current_group_view < len(self._groups):
+            self._groups[self._current_group_view]["name"] = new_name
+            self._refresh_group_combo()
+            self._group_name_entry.delete(0, "end")
+
+    def _add_new_group(self) -> None:
+        if 0 <= self._current_group_view < len(self._groups):
+            self._groups[self._current_group_view]["profiles"] = self._collect_current_profiles()
+        self._groups.append({"name": f"Group {len(self._groups) + 1}", "profiles": []})
+        self._display_group(len(self._groups) - 1)
+
+    def _delete_group(self) -> None:
+        if len(self._groups) <= 1:
+            messagebox.showwarning("Khong the xoa", "Phai co it nhat 1 group.")
+            return
+        name = self._groups[self._current_group_view]["name"]
+        if not messagebox.askyesno("Xoa Group", f"Xoa group '{name}' va tat ca profiles trong do?"):
+            return
+        del self._groups[self._current_group_view]
+        new_idx = min(self._current_group_view, len(self._groups) - 1)
+        self._display_group(new_idx)
+
+    def _refresh_group_combo(self) -> None:
+        names = [g["name"] for g in self._groups]
+        self._group_combo["values"] = names
+        if 0 <= self._current_group_view < len(names):
+            self._group_combo.current(self._current_group_view)
+        # Sync Tab5 target group combobox
+        if hasattr(self, "_gc_target_group"):
+            cur = self._gc_target_group_var.get()
+            self._gc_target_group["values"] = names
+            if cur in names:
+                self._gc_target_group.current(names.index(cur))
+            elif names:
+                self._gc_target_group.current(0)
+
     def _get_keys_targets(self) -> list[tuple[str, int]]:
         out = []
         for r in self._key_rows:
@@ -393,6 +526,15 @@ class GuiApp:
         # ── top bar ──────────────────────────────────────────────────
         top = ttk.Frame(self._tab2)
         top.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 4))
+
+        ttk.Label(top, text="Group:").pack(side="left")
+        self._s_group_var = tk.StringVar(value="Tat ca")
+        self._s_group_cb = ttk.Combobox(
+            top, textvariable=self._s_group_var,
+            values=["Tat ca"], state="readonly", width=18,
+        )
+        self._s_group_cb.pack(side="left", padx=(6, 12))
+        self._s_group_cb.bind("<<ComboboxSelected>>", self._on_s_group_changed)
 
         ttk.Label(top, text="Profile:").pack(side="left")
         self._s_profile_var = tk.StringVar(value="Tat ca")
@@ -434,6 +576,15 @@ class GuiApp:
 
         top = ttk.Frame(self._tab3)
         top.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(6, 2))
+
+        ttk.Label(top, text="Group:").pack(side="left")
+        self._f_group_var = tk.StringVar(value="Tat ca")
+        self._f_group_cb = ttk.Combobox(
+            top, textvariable=self._f_group_var,
+            values=["Tat ca"], state="readonly", width=18,
+        )
+        self._f_group_cb.pack(side="left", padx=(6, 12))
+        self._f_group_cb.bind("<<ComboboxSelected>>", self._on_f_group_changed)
 
         ttk.Label(top, text="Profile:").pack(side="left")
         self._f_profile_var = tk.StringVar(value="Tat ca")
@@ -489,42 +640,87 @@ class GuiApp:
     # ── Combo sync & refresh ───────────────────────────────────────────────────
 
     def _update_profile_combos(self) -> None:
-        names = ["Tat ca"] + [
-            r["name_var"].get().strip()
-            for r in self._key_rows if r["name_var"].get().strip()
-        ]
-        # Them key tu db
-        cursor = self.db.conn.cursor()
-        cursor.execute("SELECT DISTINCT keyword FROM results")
-        for row in cursor.fetchall():
-            k = row[0]
-            if k and k not in names:
-                names.append(k)
+        # Group combos
+        group_names = ["Tat ca"] + self.db.get_group_names()
+        if hasattr(self, "_s_group_cb"):
+            self._s_group_cb["values"] = group_names
+            if self._s_group_var.get() not in group_names:
+                self._s_group_var.set("Tat ca")
+        if hasattr(self, "_f_group_cb"):
+            self._f_group_cb["values"] = group_names
+            if self._f_group_var.get() not in group_names:
+                self._f_group_var.set("Tat ca")
 
-        self._s_cb["values"] = names
-        self._f_cb["values"] = names
-        if self._s_profile_var.get() not in names:
+        # Profile combos — filter by selected group
+        s_grp = self._s_group_var.get() if hasattr(self, "_s_group_var") else "Tat ca"
+        f_grp = self._f_group_var.get() if hasattr(self, "_f_group_var") else "Tat ca"
+
+        def _get_profile_names(grp_filter):
+            if grp_filter and grp_filter != "Tat ca":
+                seed = [
+                    p.get("name", "").strip()
+                    for g in self._groups if g["name"] == grp_filter
+                    for p in g.get("profiles", [])
+                    if p.get("name", "").strip()
+                ]
+            else:
+                seed = [
+                    p.get("name", "").strip()
+                    for g in self._groups
+                    for p in g.get("profiles", [])
+                    if p.get("name", "").strip()
+                ]
+            names = ["Tat ca"] + seed
+            cursor = self.db.conn.cursor()
+            if grp_filter and grp_filter != "Tat ca":
+                cursor.execute("SELECT DISTINCT keyword FROM results WHERE group_name = ?", (grp_filter,))
+            else:
+                cursor.execute("SELECT DISTINCT keyword FROM results")
+            for row in cursor.fetchall():
+                k = row[0]
+                if k and k not in names:
+                    names.append(k)
+            return names
+
+        s_names = _get_profile_names(s_grp)
+        f_names = _get_profile_names(f_grp)
+
+        self._s_cb["values"] = s_names
+        self._f_cb["values"] = f_names
+        if self._s_profile_var.get() not in s_names:
             self._s_profile_var.set("Tat ca")
-        if self._f_profile_var.get() not in names:
+        if self._f_profile_var.get() not in f_names:
             self._f_profile_var.set("Tat ca")
+
+    def _on_s_group_changed(self, event=None) -> None:
+        self._s_profile_var.set("Tat ca")
+        self._update_profile_combos()
+        self._refresh_success()
+
+    def _on_f_group_changed(self, event=None) -> None:
+        self._f_profile_var.set("Tat ca")
+        self._update_profile_combos()
+        self._refresh_fail()
 
     def _refresh_success(self) -> None:
         sel = self._s_profile_var.get()
-        count = self.db.get_success_count(sel)
+        grp = self._s_group_var.get() if hasattr(self, "_s_group_var") else None
+        count = self.db.get_success_count(sel, group_name=grp)
         self._lbl_s_count.config(text=f"{count} URL thanh cong")
 
     def _refresh_fail(self) -> None:
         sel = self._f_profile_var.get()
+        grp = self._f_group_var.get() if hasattr(self, "_f_group_var") else None
         for iid in self._tree_f.get_children():
             self._tree_f.delete(iid)
-        data = self.db.get_fail_results(sel)
+        data = self.db.get_fail_results(sel, group_name=grp)
         for (k, url, reason, comment_used) in data:
             tag = ("fail"    if "FORM_ERROR" in reason else
                    "captcha" if "CAPTCHA"    in reason else
                    "noform"  if "FORM_NOT"   in reason else "review")
             self._tree_f.insert("", "end", values=(k, url, reason, comment_used), tags=(tag,))
         
-        count = self.db.get_fail_count(sel)
+        count = self.db.get_fail_count(sel, group_name=grp)
         self._lbl_f_count.config(text=f"{count} URL that bai")
 
     # ═══════════════════════════════════════════════════════════════
@@ -532,63 +728,97 @@ class GuiApp:
     # ═══════════════════════════════════════════════════════════════
 
     def _on_start(self) -> None:
-        kts  = self._get_keys_targets()
-        urls = self._urls_list.copy()
+        # Thu thap profiles hien tai vao group dang xem
+        if 0 <= self._current_group_view < len(self._groups):
+            self._groups[self._current_group_view]["profiles"] = self._collect_current_profiles()
 
-        if not kts:
-            messagebox.showwarning("Thieu Profile",
-                                   "Them it nhat 1 Profile co Name/Key.")
-            return
+        urls = self._urls_list.copy()
         if not urls:
             messagebox.showwarning("Thieu URL", "Nhap it nhat 1 URL.")
             return
 
-        no_email = [r["name_var"].get().strip() for r in self._key_rows
-                    if r["name_var"].get().strip()
-                    and not r["email_var"].get().strip()]
-        if no_email:
-            messagebox.showwarning(
-                "Thieu Email",
-                "Profile chua co Email:\n" + "\n".join(f"  - {n}" for n in no_email))
+        # Xay dung group queue: chi nhung group co it nhat 1 profile co name
+        self._group_queue = []
+        for g in self._groups:
+            has_profile = any(
+                p.get("name", "").strip() for p in g.get("profiles", [])
+            )
+            if has_profile:
+                self._group_queue.append(g)
+
+        if not self._group_queue:
+            messagebox.showwarning("Thieu Profile",
+                                   "Them it nhat 1 Profile co Name/Key.")
             return
 
-        pools: dict[str, list[str]] = {}
-        for r in self._key_rows:
-            k = r["name_var"].get().strip()
-            if k:
-                pools[k] = [ln.strip() for ln in
-                              r["txt_cmt"].get("1.0", "end-1c").splitlines()
-                              if ln.strip()]
+        # Validate tat ca groups truoc khi chay
+        for g in self._group_queue:
+            gname = g["name"]
+            for p in g.get("profiles", []):
+                nm = p.get("name", "").strip()
+                if nm and not p.get("email", "").strip():
+                    messagebox.showwarning(
+                        "Thieu Email",
+                        f"Group '{gname}', profile '{nm}' chua co Email.")
+                    return
+                if nm and not [ln for ln in p.get("comments", []) if ln.strip()]:
+                    messagebox.showwarning(
+                        "Chua co Comments",
+                        f"Group '{gname}', profile '{nm}' chua co comment.")
+                    return
 
-        no_cmt = [k for k, _ in kts if not pools.get(k)]
-        if no_cmt:
-            messagebox.showwarning(
-                "Chua co Comments",
-                "Profile chua co comment:\n" + "\n".join(f"  - {k}" for k in no_cmt))
-            return
+        self._urls_for_session = urls
+        self._running_group_idx = 0
+        self._running_group_name = self._group_queue[0]["name"]
+        self._user_stopped = False
 
-        short = [f"  - {k}: co {len(pools.get(k, []))} / can {t}"
-                 for k, t in kts if 0 < len(pools.get(k, [])) < t]
-        if short:
-            if not messagebox.askyesno(
-                "Comment co the khong du",
-                "It comment hon Target (se tai su dung khi URL fail):\n"
-                + "\n".join(short) + "\n\nVan tiep tuc?"):
-                return
-
-        profiles: dict[str, wk.SessionProfile] = {}
-        for r in self._key_rows:
-            nm = r["name_var"].get().strip()
-            if nm:
-                profiles[nm] = wk.SessionProfile(
-                    name=nm,
-                    email=r["email_var"].get().strip(),
-                    host=r["host_var"].get().strip(),
-                )
+        self._btn_start.config(state="disabled")
+        self._btn_stop.config(state="normal")
 
         self._update_profile_combos()
         self._refresh_success()
         self._refresh_fail()
+
+        self._start_group(0)
+
+    def _start_group(self, idx: int) -> None:
+        """Khoi chay 1 group cu the (logic tach tu _on_start cu)."""
+        group = self._group_queue[idx]
+        group_name = group["name"]
+        profs = group.get("profiles", [])
+
+        # Tao profiles dict + pools dict + keys_targets
+        kts: list[tuple[str, int]] = []
+        pools: dict[str, list[str]] = {}
+        profiles: dict[str, wk.SessionProfile] = {}
+
+        for p in profs:
+            nm = p.get("name", "").strip()
+            if not nm:
+                continue
+            try:
+                t = int(p.get("target", 5))
+            except Exception:
+                t = 5
+            kts.append((nm, max(1, t)))
+            pools[nm] = [ln.strip() for ln in p.get("comments", []) if ln.strip()]
+            profiles[nm] = wk.SessionProfile(
+                name=nm,
+                email=p.get("email", "").strip(),
+                host=p.get("host", "").strip(),
+            )
+
+        if not kts:
+            self._advance_to_next_group()
+            return
+
+        # Short comment warning (khong block, chi log)
+        short = [f"  - {k}: co {len(pools.get(k, []))} / can {t}"
+                 for k, t in kts if 0 < len(pools.get(k, [])) < t]
+        if short:
+            print(f"[gui] Group '{group_name}' — comment it hon target:\n" + "\n".join(short))
+
+        urls = self._urls_for_session.copy()
 
         # ── Resume: loai bo URL da thanh cong, tru target da dat ──
         done_urls: set[str] = set()
@@ -596,47 +826,27 @@ class GuiApp:
         cursor.execute("SELECT url FROM results WHERE status = 'SUCCESS' OR status = 'MODERATION'")
         for row in cursor.fetchall():
             done_urls.add(row[0])
-        
+
         urls = [u for u in urls if u not in done_urls]
-        skipped = len(done_urls)
 
         # Tru so da thanh cong tu target — chi chay phan con lai
         adjusted_kts: list[tuple[str, int]] = []
         existing_success: dict[str, int] = {}
         for k, t in kts:
-            already = self.db.get_success_count(k)
+            already = self.db.get_success_count(k, group_name=group_name)
             existing_success[k] = already
             remaining = max(0, t - already)
             adjusted_kts.append((k, remaining))
 
-        # Kiem tra con viec de lam khong
         total_remaining = sum(t for _, t in adjusted_kts)
         if total_remaining == 0:
-            messagebox.showinfo(
-                "Da hoan thanh",
-                "Tat ca profile da du target tu ket qua truoc do.\n"
-                "Bam 'Xoa ket qua' o Tab Thanh cong neu muon chay lai.")
+            print(f"[gui] Group '{group_name}' da du target — skip")
+            self._advance_to_next_group()
             return
         if not urls:
-            messagebox.showwarning(
-                "Het URL",
-                f"Da loc {skipped} URL thanh cong truoc do — khong con URL nao de chay.\n"
-                "Them URL moi hoac bam 'Xoa ket qua' o Tab Thanh cong.")
+            print(f"[gui] Group '{group_name}' — het URL — skip")
+            self._advance_to_next_group()
             return
-
-        if skipped > 0:
-            resume_info = "\n".join(
-                f"  - {k}: da co {existing_success[k]}/{t}, con lai {max(0, t - existing_success[k])}"
-                for k, t in kts
-            )
-            if not messagebox.askyesno(
-                "Tiep tuc tu lan truoc",
-                f"Tim thay {skipped} URL da thanh cong truoc do.\n"
-                f"Da loc bo khoi danh sach chay.\n\n"
-                f"Tien do hien tai:\n{resume_info}\n\n"
-                f"Con lai {len(urls)} URL, {total_remaining} target.\n"
-                f"Tiep tuc?"):
-                return
 
         self._scheduler = wk.JobScheduler(
             urls=urls, keys_targets=adjusted_kts,
@@ -648,20 +858,10 @@ class GuiApp:
         self._done_jobs  = 0
         self._progressbar["maximum"] = self._total_jobs
         self._progressbar["value"]   = 0
-        self._progress_lbl.config(text=f"0 / {self._total_jobs}")
+        grp_label = f"[{idx+1}/{len(self._group_queue)}] {group_name}"
+        self._progress_lbl.config(text=f"{grp_label} — 0 / {self._total_jobs}")
+        self._grp_label = grp_label
 
-        for r in self._key_rows:
-            k = r["name_var"].get().strip()
-            try:
-                t = int(r["target_var"].get())
-            except Exception:
-                t = 0
-            if k:
-                already = existing_success.get(k, 0)
-                r["prog_lbl"].config(text=f"{already}/{t}")
-
-        self._btn_start.config(state="disabled")
-        self._btn_stop.config(state="normal")
         self._stop_event_holder.clear()
 
         def _thread_target():
@@ -672,11 +872,11 @@ class GuiApp:
                     headless=self._headless_var.get(),
                     stop_event_holder=self._stop_event_holder,
                     bypass_name=self._bypass_name_var.get(),
+                    group_name=group_name,
                 )
             except Exception as exc:
                 import traceback
                 err = traceback.format_exc()
-                # GUI hien thi loi trong main thread
                 self._result_queue.put(wk.Result(
                     status=wk.STATUS_DONE,
                     error_detail=f"THREAD CRASH: {exc}",
@@ -693,6 +893,8 @@ class GuiApp:
         self._session_thread.start()
 
     def _on_stop(self) -> None:
+        self._user_stopped = True
+        self._group_queue = []          # Khong auto-continue
         for ev, loop in self._stop_event_holder:
             try:
                 loop.call_soon_threadsafe(ev.set)
@@ -701,6 +903,50 @@ class GuiApp:
         self._btn_stop.config(state="disabled")
         self._progress_lbl.config(
             text=self._progress_lbl.cget("text") + "  [dang dung...]")
+
+    def _advance_to_next_group(self) -> None:
+        """Chuyen sang group tiep theo hoac ket thuc."""
+        group_queue = getattr(self, "_group_queue", [])
+        idx = getattr(self, "_running_group_idx", 0)
+        prev_name = getattr(self, "_running_group_name", "")
+
+        next_idx = idx + 1
+        if next_idx < len(group_queue):
+            # Co group tiep theo
+            # Uu tien URL thanh cong tu group truoc
+            if prev_name:
+                success_urls = self.db.get_group_success_urls(prev_name)
+                self.db.reset_queue_with_priority(success_urls)
+                self.db.clear_domain_stats()
+
+            self._running_group_idx = next_idx
+            self._running_group_name = group_queue[next_idx]["name"]
+            self._progress_lbl.config(
+                text=f"Cho 10s → Group tiep theo: {group_queue[next_idx]['name']}...")
+            self.root.after(10000, lambda: self._start_group(next_idx))
+        else:
+            # Het groups
+            self._btn_start.config(state="normal")
+            self._btn_stop.config(state="disabled")
+            n = len(group_queue)
+            self._progress_lbl.config(text=f"Hoan tat {n} group(s)")
+            self._group_queue = []
+
+    def _auto_export_group_csv(self, group_name: str) -> None:
+        """Tu dong export CSV ket qua thanh cong cua 1 group."""
+        import os
+        folder = r"C:\Users\trand\Documents\BLCM"
+        try:
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, f"{group_name}.csv")
+            rows = self.db.get_success_results(group_name=group_name)
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(["profile", "url_goc", "link_thanh_cong", "status"])
+                w.writerows(rows)
+            print(f"[CSV] Exported {len(rows)} rows → {path}")
+        except Exception as exc:
+            print(f"[CSV] Export error for group '{group_name}': {exc}")
 
     # ═══════════════════════════════════════════════════════════════
     # Result polling & handling
@@ -725,7 +971,8 @@ class GuiApp:
         if r.status == wk.STATUS_PROGRESS:
             self._done_jobs += 1
             self._progressbar["value"] = self._done_jobs
-            self._progress_lbl.config(text=f"{self._done_jobs} / {self._total_jobs}")
+            grp = getattr(self, "_grp_label", "")
+            self._progress_lbl.config(text=f"{grp} — {self._done_jobs} / {self._total_jobs}")
             if self._scheduler and r.key:
                 sm  = self._scheduler.get_success()
                 tgt = self._scheduler.get_target(r.key)
@@ -738,20 +985,17 @@ class GuiApp:
             return
 
         if r.status == wk.STATUS_DONE:
-            self._btn_start.config(state="normal")
-            self._btn_stop.config(state="disabled")
-            if self._scheduler:
-                sm    = self._scheduler.get_success()
-                parts = " | ".join(
-                    f"{k}: {v}/{self._scheduler.get_target(k)}"
-                    for k, v in sm.items())
-                self._progress_lbl.config(text=f"Xong - {parts}")
+            gname = getattr(self, "_running_group_name", "")
+            if gname:
+                self._auto_export_group_csv(gname)
+            self._advance_to_next_group()
             return
 
         key = r.key or "?"
 
         if r.status in (wk.STATUS_SUCCESS, wk.STATUS_MODERATION):
-            self.db.add_result(key, r.url, r.comment_link or "", r.status)
+            self.db.add_result(key, r.url, r.comment_link or "", r.status,
+                               group_name=r.group_name, comment_used=r.comment_used)
             self._refresh_success()
             return
 
@@ -759,7 +1003,8 @@ class GuiApp:
         if r.error_detail:
             reason += f" - {r.error_detail}"
 
-        self.db.add_result(key, r.url, r.comment_used or "", reason)
+        self.db.add_result(key, r.url, r.comment_used or "", reason,
+                           group_name=r.group_name, comment_used=r.comment_used)
         self._refresh_fail()
 
     # ═══════════════════════════════════════════════════════════════
@@ -775,7 +1020,8 @@ class GuiApp:
         if not path:
             return
         sel = self._s_profile_var.get()
-        rows = self.db.get_success_results(sel)
+        grp = self._s_group_var.get() if hasattr(self, "_s_group_var") else None
+        rows = self.db.get_success_results(sel, group_name=grp)
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             w.writerow(["profile", "url_goc", "link_thanh_cong", "status"])
@@ -1127,26 +1373,13 @@ class GuiApp:
 
     def _gather_state(self) -> dict:
         """Thu thap toan bo trang thai hien tai de luu."""
-        profiles = []
-        for r in self._key_rows:
-            comments = [
-                ln for ln in r["txt_cmt"].get("1.0", "end-1c").splitlines()
-                if ln.strip()
-            ]
-            try:
-                target = int(r["target_var"].get())
-            except Exception:
-                target = 5
-            profiles.append({
-                "name":    r["name_var"].get(),
-                "email":   r["email_var"].get(),
-                "host":    r["host_var"].get(),
-                "target":  target,
-                "comments": comments,
-            })
+        # Luu profiles hien tai vao group dang xem
+        if 0 <= self._current_group_view < len(self._groups):
+            self._groups[self._current_group_view]["profiles"] = self._collect_current_profiles()
+
         urls = "\n".join(self._urls_list)
         return {
-            "profiles": profiles,
+            "groups": self._groups,
             "urls": urls,
             "headless": self._headless_var.get(),
             "workers":  self._worker_var.get(),
@@ -1174,29 +1407,31 @@ class GuiApp:
     def _load_state(self) -> None:
         """Tai trang thai tu gui_state.json neu ton tai."""
         if not self._state_file.exists():
-            self._add_profile_card()
+            self._groups = [{"name": "Default", "profiles": []}]
+            self._display_group(0)
             return
         try:
             raw = self._state_file.read_text(encoding="utf-8")
             state = json.loads(raw)
         except Exception as exc:
             print(f"[gui] Khong the doc state: {exc}")
-            self._add_profile_card()
+            self._groups = [{"name": "Default", "profiles": []}]
+            self._display_group(0)
             return
 
         try:
-            profiles = state.get("profiles", [])
-            if profiles:
-                for p in profiles:
-                    self._add_profile_card(
-                        name=p.get("name", ""),
-                        email=p.get("email", ""),
-                        host=p.get("host", ""),
-                        target=p.get("target", 5),
-                        comments=p.get("comments", []),
-                    )
+            # Backward compatible: "groups" moi hoac "profiles" cu
+            if "groups" in state:
+                self._groups = state["groups"]
+            elif "profiles" in state and state["profiles"]:
+                self._groups = [{"name": "Default", "profiles": state["profiles"]}]
             else:
-                self._add_profile_card()
+                self._groups = [{"name": "Default", "profiles": []}]
+
+            if not self._groups:
+                self._groups = [{"name": "Default", "profiles": []}]
+
+            self._display_group(0)
 
             urls = state.get("urls", "")
             if urls:
@@ -1209,12 +1444,16 @@ class GuiApp:
                 self._worker_var.set(int(state.get("workers", 3)))
             except Exception:
                 pass
-            print(f"[gui] Da tai state: {len(profiles)} profiles, "
-                  f"{len(urls)} chars URLs")
+
+            total_profiles = sum(len(g.get("profiles", [])) for g in self._groups)
+            print(f"[gui] Da tai state: {len(self._groups)} groups, "
+                  f"{total_profiles} profiles, {len(urls)} chars URLs")
         except Exception as exc:
             print(f"[gui] Loi khi tai state: {exc}")
+            if not self._groups:
+                self._groups = [{"name": "Default", "profiles": []}]
             if not self._key_rows:
-                self._add_profile_card()
+                self._display_group(0)
 
     def _clear_success_data(self) -> None:
         """Xoa toan bo ket qua (in-memory + sqlite)."""
@@ -1333,13 +1572,23 @@ class GuiApp:
             cursor="hand2", command=self._gc_clear_all,
         ).pack(side="left", padx=(8, 0))
 
+        self._gc_target_group_var = tk.StringVar()
+        self._gc_target_group = ttk.Combobox(
+            ctrl, textvariable=self._gc_target_group_var,
+            values=[g["name"] for g in self._groups],
+            state="readonly", width=16,
+        )
+        self._gc_target_group.pack(side="left", padx=(8, 0))
+        if self._groups:
+            self._gc_target_group.current(0)
+
         tk.Button(
-            ctrl, text="Them vao Tab 1",
+            ctrl, text="Them vao GR",
             font=("Segoe UI", 9, "bold"),
             bg=MOD_CLR, fg=BTN_FG,
             relief="flat", padx=14, pady=6,
-            cursor="hand2", command=self._gc_send_to_tab1,
-        ).pack(side="left", padx=(8, 0))
+            cursor="hand2", command=self._gc_send_to_group,
+        ).pack(side="left", padx=(4, 0))
 
         # Email + Website for Tab 1 profiles
         ttk.Label(ctrl, text="Email:").pack(side="left", padx=(16, 2))
@@ -1547,8 +1796,8 @@ class GuiApp:
         self._gc_progressbar["value"] = 0
         self._gc_progress_lbl.config(text="")
 
-    def _gc_send_to_tab1(self) -> None:
-        """Tao profile trong Tab 1 cho moi keyword co comment."""
+    def _gc_send_to_group(self) -> None:
+        """Them profiles vao group duoc chon (khong xoa profiles cu)."""
         if not self._gc_comments or not any(self._gc_comments.values()):
             messagebox.showwarning("Trong", "Chua co comment nao de them.")
             return
@@ -1556,32 +1805,42 @@ class GuiApp:
         email = self._gc_email_var.get().strip()
         host = self._gc_host_var.get().strip()
         if not email:
-            messagebox.showwarning("Thieu Email", "Nhap email truoc khi them vao Tab 1.")
+            messagebox.showwarning("Thieu Email", "Nhap email truoc khi them.")
             return
 
-        # Xoa tat ca profile cu
-        for r in list(self._key_rows):
-            r["frame"].destroy()
-        self._key_rows.clear()
+        target_idx = self._gc_target_group.current()
+        if target_idx < 0 or target_idx >= len(self._groups):
+            messagebox.showwarning("Group", "Chon group truoc khi them.")
+            return
 
+        # Save current Tab1 view into its group first
+        if 0 <= self._current_group_view < len(self._groups):
+            self._groups[self._current_group_view]["profiles"] = self._collect_current_profiles()
+
+        group_name = self._groups[target_idx]["name"]
         count = 0
         for keyword, cmts in self._gc_comments.items():
             if not cmts:
                 continue
-            self._add_profile_card(
-                name=keyword,
-                email=email,
-                host=host,
-                target=len(cmts),
-                comments=cmts,
-            )
+            prof = {
+                "name": keyword,
+                "email": email,
+                "host": host,
+                "target": len(cmts),
+                "comments": cmts,
+            }
+            self._groups[target_idx].setdefault("profiles", []).append(prof)
             count += 1
 
+        # If viewing the target group, refresh cards
+        if target_idx == self._current_group_view:
+            self._display_group(target_idx)
+
         self._update_profile_combos()
-        self._notebook.select(0)
+        total_cmts = sum(len(v) for v in self._gc_comments.values())
         messagebox.showinfo(
             "Da them",
-            f"Da tao {count} profile voi tong {sum(len(v) for v in self._gc_comments.values())} comment.")
+            f"Da them {count} profile ({total_cmts} comment) vao {group_name}.")
 
     # ── Common helpers ─────────────────────────────────────────────────────────
 

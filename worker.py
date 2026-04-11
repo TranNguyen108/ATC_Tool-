@@ -84,6 +84,7 @@ class Result:
     error_detail: str = ""
     strategy: str = ""              # layer nao detect duoc form
     key: str = ""                   # keyword dang chay (de GUI hien thi per-key)
+    group_name: str = ""            # ten group (multi-group)
     # Chi dung khi status == STATUS_CAPTCHA:
     captcha_event: Optional[asyncio.Event] = field(default=None, repr=False)
     captcha_loop: Optional[asyncio.AbstractEventLoop] = field(default=None, repr=False)
@@ -164,6 +165,10 @@ class JobScheduler:
         self._pools: dict[str, deque[str]] = {
             k: deque(v) for k, v in comment_pools.items()
         }
+        # Backup goc de recycle khi pool het
+        self._pools_backup: dict[str, list[str]] = {
+            k: list(v) for k, v in comment_pools.items()
+        }
         self._profiles: dict[str, SessionProfile] = profiles or {}
         self._target_map: dict[str, int] = {k: t for k, t in keys_targets}
         # in-flight: URL da dispatch nhung chua hoan thanh (dung cho watchdog recovery)
@@ -205,9 +210,12 @@ class JobScheduler:
                 if pool and len(pool) > 0:
                     valid_comment = pool.popleft()
                 else:
-                    # Provide a generic fallback comment when the pool is completely empty
-                    # Realtime AI will override this fallback when the page loads!
-                    valid_comment = "Bài viết rất hay và chi tiết, cảm ơn bạn đã chia sẻ!"
+                    # Pool het → recycle random tu pool goc
+                    backup = self._pools_backup.get(key, [])
+                    if backup:
+                        valid_comment = random.choice(backup)
+                    else:
+                        valid_comment = "Bài viết rất hay và chi tiết, cảm ơn bạn đã chia sẻ!"
                     
                 valid_key = key
                 self._key_idx = (idx + 1) % total_keys
@@ -617,23 +625,30 @@ async def _force_close_context(wid: int, label: str = "") -> None:
 
 
 _USER_AGENTS = [
-    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36", "Windows"),
-    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", "Windows"),
-    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/123.0.0.0 Safari/537.36", "Windows"),
-    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36", "macOS"),
-    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", "macOS")
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36", "Windows"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36", "Windows"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36", "Windows"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edg/131.0.0.0 Safari/537.36", "Windows"),
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36", "macOS"),
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", "macOS")
 ]
+
+_UA_VERSION_RE = re.compile(r'(?:Chrome|Edg)/([\d]+)')
 
 def _get_random_ua_headers() -> tuple[str, dict[str, str]]:
     ua, platform = random.choice(_USER_AGENTS)
     
-    if "Edge" in ua:
-        sec_ch_ua = '"Microsoft Edge";v="123", "Not:A-Brand";v="8", "Chromium";v="123"'
+    # Extract version dynamically from UA string
+    m = _UA_VERSION_RE.search(ua)
+    ver = m.group(1) if m else "134"
+    
+    if "Edg/" in ua:
+        sec_ch_ua = f'"Microsoft Edge";v="{ver}", "Not:A-Brand";v="8", "Chromium";v="{ver}"'
     else:
-        sec_ch_ua = '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"'
+        sec_ch_ua = f'"Google Chrome";v="{ver}", "Not:A-Brand";v="8", "Chromium";v="{ver}"'
         
     headers = {
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
         "Sec-Ch-Ua": sec_ch_ua,
         "Sec-Ch-Ua-Mobile": "?0",
         "Sec-Ch-Ua-Platform": f'"{platform}"',
@@ -653,6 +668,7 @@ async def _process_url(
     stop_event: Optional[asyncio.Event] = None,
     bypass_name: bool = False,
     worker_id: int = 0,
+    group_name: str = "",
 ) -> str:
     """
     Xu ly 1 URL. Tra ve final_status (STATUS_*) de caller cap nhat scheduler.
@@ -667,8 +683,8 @@ async def _process_url(
             user_agent=ua,
             extra_http_headers=extra_headers,
             viewport={"width": random.randint(1280, 1440), "height": random.randint(768, 900)},
-            locale="en-US",
-            timezone_id="America/New_York",
+            locale="vi-VN",
+            timezone_id="Asia/Ho_Chi_Minh",
         )
         _active_contexts[worker_id] = context
         page = await context.new_page()
@@ -713,6 +729,7 @@ async def _process_url(
                     url=url, status=STATUS_NO_FORM, key=key,
                     comment_used=comment, comment_link=url,
                     error_detail="Trang khong phan hoi (timeout 30s)",
+                    group_name=group_name,
                 ))
                 return STATUS_NO_FORM
 
@@ -826,24 +843,19 @@ async def _process_url(
             form_hint = 0
 
         if form_hint == 0:
-            # Scroll dần từng viewport để trigger lazy-load (comment list dài)
+            # Smart scroll: 4-stop jump (30%/60%/90%/100%) instead of viewport-by-viewport
             try:
-                await page.evaluate("window.scrollTo({top: 0, behavior: 'instant'})")
-                await asyncio.sleep(0.2)
-                vh = await page.evaluate("() => window.innerHeight") or 800
                 total_h = await page.evaluate("() => document.body.scrollHeight") or 5000
-                pos = 0
-                for _ in range(30):
-                    pos += vh * 3
-                    if pos >= total_h:
-                        break
-                    await page.evaluate(f"window.scrollTo({{top: {pos}, behavior: 'instant'}})")
-                    await asyncio.sleep(0.1)
+                for pct in (0.3, 0.6, 0.9, 1.0):
+                    target = int(total_h * pct)
+                    await page.evaluate(f"window.scrollTo({{top: {target}, behavior: 'instant'}})")
+                    await asyncio.sleep(0.15)
+                    # Check if page grew (infinite scroll / lazy load)
                     new_h = await page.evaluate("() => document.body.scrollHeight")
                     if new_h > total_h:
                         total_h = new_h
                 await page.evaluate("window.scrollTo({top: document.body.scrollHeight, behavior: 'instant'})")
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.8)
                 form_hint = await page.evaluate("""() => {
                     const fs = document.querySelectorAll('form');
                     for (const f of fs) {
@@ -863,6 +875,7 @@ async def _process_url(
                     url=url, status=STATUS_NO_FORM, key=key,
                     comment_used=comment, comment_link=url,
                     error_detail="Trang khong co form comment",
+                    group_name=group_name,
                 ))
                 return STATUS_NO_FORM
         log.debug(f"[{key}] quick check form_hint={form_hint} — {time.monotonic()-t0:.1f}s")
@@ -952,6 +965,7 @@ async def _process_url(
                 url=url, status=STATUS_NO_FORM, key=key,
                 comment_used=comment, comment_link=url,
                 error_detail="Khong tim thay comment form",
+                group_name=group_name,
             ))
             return STATUS_NO_FORM
         log.info(f"[{key}] FORM found strategy={form_result.strategy} — {time.monotonic()-t0:.1f}s")
@@ -963,12 +977,18 @@ async def _process_url(
                 url=url, status=STATUS_CAPTCHA_FAILED, key=key,
                 comment_used=comment, comment_link=url,
                 error_detail="Captcha detected — skip",
+                group_name=group_name,
             ))
             return STATUS_CAPTCHA_FAILED
 
         # ── Check stop event giữa các bước ──
         if stop_event and stop_event.is_set():
             return STATUS_REVIEW
+
+        # ── 4b. Akismet signals: mouse/focus on form + reading pause ──
+        if form_result.form:
+            await human_sim.emit_form_signals(page, form_result.form)
+        await asyncio.sleep(random.uniform(0.3, 0.5))
 
         # ── 5. FILL + SUBMIT (flat — no nested class/closure) ──
 
@@ -977,6 +997,7 @@ async def _process_url(
                 url=url, status=STATUS_REVIEW, key=key,
                 comment_used=comment, comment_link=url,
                 error_detail="Page closed truoc khi dien form",
+                group_name=group_name,
             ))
             return STATUS_REVIEW
 
@@ -986,7 +1007,7 @@ async def _process_url(
             if not field_loc or not value:
                 return True  # không cần fill
             try:
-                await human_sim.fast_fill(field_loc, value)
+                await human_sim.fast_fill(field_loc, value, page=page)
                 return True
             except Exception:
                 pass
@@ -1067,6 +1088,7 @@ async def _process_url(
                 url=url, status=STATUS_FORM_ERROR, key=key,
                 comment_used=comment, comment_link=url,
                 error_detail="Khong dien duoc email — skip URL",
+                group_name=group_name,
             ))
             return STATUS_FORM_ERROR
 
@@ -1076,16 +1098,18 @@ async def _process_url(
                 url=url, status=STATUS_NO_FORM, key=key,
                 comment_used=comment, comment_link=url,
                 error_detail="Khong tim thay textarea comment",
+                group_name=group_name,
             ))
             return STATUS_NO_FORM
 
         try:
-            await human_sim.type_text(form_result.f_comment, comment)
+            await human_sim.type_text(form_result.f_comment, comment, page=page)
         except Exception as exc:
             result_queue.put(Result(
                 url=url, status=STATUS_FORM_ERROR, key=key,
                 comment_used=comment, comment_link=url,
                 error_detail=f"Fill comment loi: {exc}",
+                group_name=group_name,
             ))
             return STATUS_FORM_ERROR
 
@@ -1097,6 +1121,7 @@ async def _process_url(
                     url=url, status=STATUS_FORM_ERROR, key=key,
                     comment_used=comment, comment_link=url,
                     error_detail=f"Comment khong ghi vao textarea (len={len(val) if val else 0})",
+                    group_name=group_name,
                 ))
                 return STATUS_FORM_ERROR
         except Exception:
@@ -1108,6 +1133,7 @@ async def _process_url(
                 url=url, status=STATUS_NO_FORM, key=key,
                 comment_used=comment, comment_link=url,
                 error_detail="Khong tim thay nut submit",
+                group_name=group_name,
             ))
             return STATUS_NO_FORM
 
@@ -1116,6 +1142,7 @@ async def _process_url(
                 url=url, status=STATUS_REVIEW, key=key,
                 comment_used=comment, comment_link=url,
                 error_detail="Page closed truoc khi submit",
+                group_name=group_name,
             ))
             return STATUS_REVIEW
 
@@ -1138,6 +1165,7 @@ async def _process_url(
                         url=url, status=STATUS_REVIEW, key=key,
                         comment_used=comment, comment_link=url,
                         error_detail=f"Click submit bi overlay chan: {exc2}",
+                        group_name=group_name,
                     ))
                     return STATUS_REVIEW
             else:
@@ -1146,6 +1174,7 @@ async def _process_url(
                     url=url, status=STATUS_REVIEW, key=key,
                     comment_used=comment, comment_link=url,
                     error_detail=f"Click submit loi: {exc}",
+                    group_name=group_name,
                 ))
                 return STATUS_REVIEW
 
@@ -1183,6 +1212,7 @@ async def _process_url(
                     url=url, status=STATUS_REVIEW, key=key,
                     comment_used=comment, comment_link=url,
                     error_detail="Page closed before response could be read",
+                    group_name=group_name,
                 ))
                 return STATUS_REVIEW
 
@@ -1221,6 +1251,7 @@ async def _process_url(
             comment_link=comment_link,
             strategy=form_result.strategy,
             key=key,
+            group_name=group_name,
         ))
         return final_status
 
@@ -1230,6 +1261,7 @@ async def _process_url(
             url=url, status=STATUS_REVIEW, key=key,
             comment_used=comment, comment_link=url,
             error_detail="TargetClosedError: browser/context da bi dong",
+            group_name=group_name,
         ))
         return STATUS_REVIEW
     except Exception as exc:
@@ -1238,6 +1270,7 @@ async def _process_url(
             url=url, status=STATUS_REVIEW, key=key,
             comment_used=comment, comment_link=url,
             error_detail=str(exc),
+            group_name=group_name,
         ))
         return STATUS_REVIEW
     finally:
@@ -1278,6 +1311,7 @@ async def _run_async(
     headless: bool,
     stop_event: asyncio.Event,
     bypass_name: bool = False,
+    group_name: str = "",
 ) -> None:
     """Coroutine chinh: khoi browser, chay worker loops song song.
     Co watchdog: neu 5 phut khong co URL nao hoan thanh → huy worker,
@@ -1356,13 +1390,13 @@ async def _run_async(
                             profile = scheduler.get_profile(key)
                             try:
                                 final_status = await asyncio.wait_for(
-                                    _process_url(url, comment, key, profile, browser, result_queue, loop, headless, stop_event=stop_event, bypass_name=bypass_name, worker_id=wid),
+                                    _process_url(url, comment, key, profile, browser, result_queue, loop, headless, stop_event=stop_event, bypass_name=bypass_name, worker_id=wid, group_name=group_name),
                                     timeout=_URL_TIMEOUT,
                                 )
                             except (asyncio.TimeoutError, Exception) as exc:
                                 label = "timeout" if isinstance(exc, asyncio.TimeoutError) else "unhandled"
                                 await _force_close_context(wid, label)
-                                result_queue.put(Result(url=url, status=STATUS_REVIEW, key=key, comment_used=comment, error_detail=f"Worker error: {exc}"))
+                                result_queue.put(Result(url=url, status=STATUS_REVIEW, key=key, comment_used=comment, error_detail=f"Worker error: {exc}", group_name=group_name))
                                 scheduler.return_comment(key, comment)
                                 scheduler.finalize_job(url)
                                 _lrt[0] = time.monotonic()
@@ -1374,7 +1408,7 @@ async def _run_async(
                                 scheduler.return_comment(key, comment)
                             scheduler.finalize_job(url)
                             _lrt[0] = time.monotonic()
-                            result_queue.put(Result(status=STATUS_PROGRESS, key=key))
+                            result_queue.put(Result(status=STATUS_PROGRESS, key=key, group_name=group_name))
 
                             async with _restart_lock:
                                 _urls_since_restart[0] += 1
@@ -1434,7 +1468,7 @@ async def _run_async(
 
         log.info(f"[SESSION] Done. Final Status: {scheduler.status_summary()}")
 
-    result_queue.put(Result(status=STATUS_DONE))
+    result_queue.put(Result(status=STATUS_DONE, group_name=group_name))
 
 
 def run_session(
@@ -1444,6 +1478,7 @@ def run_session(
     headless: bool = False,
     stop_event_holder: list | None = None,
     bypass_name: bool = False,
+    group_name: str = "",
 ) -> None:
     """
     Entry point cho background thread.
@@ -1472,7 +1507,7 @@ def run_session(
 
     try:
         loop.run_until_complete(
-            _run_async(scheduler, result_queue, max_workers, headless, stop_event, bypass_name)
+            _run_async(scheduler, result_queue, max_workers, headless, stop_event, bypass_name, group_name)
         )
     finally:
         loop.close()
