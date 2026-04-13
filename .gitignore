@@ -3,5 +3,4 @@ build/
 dist/
 *.pyc
 .env
-gui_state.json
 *.spec
