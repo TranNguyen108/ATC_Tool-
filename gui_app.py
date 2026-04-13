@@ -5,15 +5,37 @@ Tab 2: Thanh cong  — loc theo profile
 Tab 3: That bai    — loc theo profile
 Tab 4: Loc Link    — strip/dedup/shuffle URLs
 Tab 5: Gen Comment — sinh comment bang Groq AI
+Tab 6: Log         — xem log real-time de debug
 """
 
 from __future__ import annotations
+
+
+# ── Logging handler: forward Python log → Tab 6 text widget ──────────────────
+
+import logging as _logging
+
+
+class _GuiLogHandler(_logging.Handler):
+    """Thread-safe logging handler: emit() gui record ve callback trong main thread."""
+
+    def __init__(self, callback):
+        super().__init__()
+        self._callback = callback  # callable(level_str: str, text: str)
+
+    def emit(self, record: _logging.LogRecord) -> None:
+        try:
+            text = self.format(record)
+            self._callback(record.levelname, text)
+        except Exception:
+            self.handleError(record)
 
 import csv
 import json
 import queue
 import random
 import re
+import logging
 import threading
 import time
 import webbrowser
@@ -73,6 +95,9 @@ class GuiApp:
         self._load_state()
         self._poll_results()
 
+        # ── Gui log handler (wires Python logging → Tab 6 text widget) ──
+        self._attach_log_handler()
+
         # Luu state khi dong cua so
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -121,17 +146,20 @@ class GuiApp:
         self._tab3 = ttk.Frame(nb)
         self._tab4 = ttk.Frame(nb)
         self._tab5 = ttk.Frame(nb)
+        self._tab6 = ttk.Frame(nb)
         nb.add(self._tab1, text="Cau hinh & Chay")
         nb.add(self._tab2, text="Thanh cong")
         nb.add(self._tab3, text="That bai")
         nb.add(self._tab4, text="Loc Link")
         nb.add(self._tab5, text="Gen Comment")
+        nb.add(self._tab6, text="Log")
 
         self._build_tab1()
         self._build_tab2()
         self._build_tab3()
         self._build_tab4()
         self._build_tab5()
+        self._build_tab6()
 
     # ═══════════════════════════════════════════════════════════════
     # TAB 1
@@ -215,7 +243,7 @@ class GuiApp:
         right = ttk.Frame(self._tab1)
         right.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=8)
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(2, weight=1)
+        right.rowconfigure(3, weight=1)
 
         opt = ttk.Frame(right)
         opt.grid(row=0, column=0, sticky="ew", pady=(0, 6))
@@ -232,9 +260,41 @@ class GuiApp:
         ttk.Checkbutton(opt, text="Bypass name filter",
                         variable=self._bypass_name_var).pack(side="left", padx=(16, 0))
 
+        # ── Proxy frame ──
+        proxy_fr = ttk.LabelFrame(right, text=" Proxy ", padding=6)
+        proxy_fr.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        proxy_fr.columnconfigure(0, weight=1)
+
+        _proxy_top = ttk.Frame(proxy_fr)
+        _proxy_top.pack(fill="x")
+        ttk.Label(_proxy_top, text="Moi dong 1 proxy (ip:port:user:password):",
+                  font=("Segoe UI", 8)).pack(side="left")
+        ttk.Label(_proxy_top, text="Rotate moi:", font=("Segoe UI", 8)).pack(side="left", padx=(12, 2))
+        self._proxy_rotate_var = tk.IntVar(value=250)
+        ttk.Spinbox(_proxy_top, from_=50, to=5000, increment=50, width=6,
+                    textvariable=self._proxy_rotate_var).pack(side="left")
+        ttk.Label(_proxy_top, text="success", font=("Segoe UI", 8)).pack(side="left", padx=(2, 0))
+
+        self._proxy_text = tk.Text(proxy_fr, height=4, bg=ENTRY_BG, fg=HEADING_FG,
+                                   font=("Consolas", 9), insertbackground=HEADING_FG,
+                                   relief="flat", bd=1)
+        self._proxy_text.pack(fill="x", pady=(4, 4))
+
+        _proxy_btns = ttk.Frame(proxy_fr)
+        _proxy_btns.pack(fill="x")
+        self._btn_test_proxy = tk.Button(
+            _proxy_btns, text="Test Proxies",
+            font=("Segoe UI", 8, "bold"), bg=ENTRY_BG, fg=HEADING_FG,
+            relief="flat", padx=8, pady=2, cursor="hand2",
+            command=self._test_proxies,
+        )
+        self._btn_test_proxy.pack(side="left")
+        self._proxy_status_lbl = ttk.Label(_proxy_btns, text="", font=("Segoe UI", 8))
+        self._proxy_status_lbl.pack(side="left", padx=(8, 0))
+
         # URL label + live count
         url_hdr = ttk.Frame(right)
-        url_hdr.grid(row=1, column=0, sticky="ew", pady=(0, 2))
+        url_hdr.grid(row=2, column=0, sticky="ew", pady=(0, 2))
         ttk.Label(
             url_hdr, text="Danh sach URL (moi dong 1 URL):",
             foreground=HEADING_FG, font=("Segoe UI", 9, "bold"),
@@ -245,7 +305,7 @@ class GuiApp:
         self._lbl_url_count.pack(side="right")
 
         url_fr = ttk.Frame(right)
-        url_fr.grid(row=2, column=0, sticky="nsew")
+        url_fr.grid(row=3, column=0, sticky="nsew")
         url_fr.rowconfigure(0, weight=1)
         url_fr.columnconfigure(0, weight=1)
 
@@ -258,7 +318,7 @@ class GuiApp:
         self._btn_import_urls.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=(4, 8))
 
         cb = ttk.Frame(right)
-        cb.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        cb.grid(row=4, column=0, sticky="ew", pady=(8, 0))
 
         self._btn_start = tk.Button(
             cb, text="Bat dau",
@@ -277,6 +337,15 @@ class GuiApp:
             cursor="hand2", command=self._on_stop, state="disabled",
         )
         self._btn_stop.pack(side="left", padx=(8, 0))
+
+        self._btn_reset_all = tk.Button(
+            cb, text="XOÁ TẤT CẢ",
+            font=("Segoe UI", 10, "bold"),
+            bg="#fab387", fg=BTN_FG,
+            relief="flat", padx=14, pady=6,
+            cursor="hand2", command=self._reset_all_url_data,
+        )
+        self._btn_reset_all.pack(side="left", padx=(16, 0))
 
         self._progress_lbl = ttk.Label(cb, text="")
         self._progress_lbl.pack(side="left", padx=(14, 0))
@@ -302,6 +371,156 @@ class GuiApp:
                 messagebox.showinfo("Import thanh cong", f"Da nhap {len(self._urls_list)} URLs tu file.")
             except Exception as e:
                 messagebox.showerror("Loi", f"Loi khi doc file: {e}")
+
+    def _test_proxies(self) -> None:
+        """Test proxy concurrent — hien thi popup ket qua chi tiet (IP, latency, loi)."""
+        import httpx, time as _time, concurrent.futures
+
+        raw = self._proxy_text.get("1.0", "end-1c").strip()
+        lines = [l.strip() for l in raw.splitlines() if l.strip()]
+        if not lines:
+            self._proxy_status_lbl.config(text="Khong co proxy nao de test")
+            return
+
+        self._btn_test_proxy.config(state="disabled")
+        self._proxy_status_lbl.config(text=f"Dang test {len(lines)} proxies...")
+
+        # ── Popup ket qua ──────────────────────────────────────────────────
+        win = tk.Toplevel(self.root)
+        win.title("Ket qua kiem tra Proxy")
+        win.configure(bg=BG)
+        win.geometry("720x480")
+        win.resizable(True, True)
+
+        hdr = ttk.Label(win, text=f"Test {len(lines)} proxies (concurrent 10 luong)...",
+                        font=("Segoe UI", 9, "bold"), foreground=HEADING_FG)
+        hdr.pack(anchor="w", padx=10, pady=(8, 4))
+
+        txt_fr = ttk.Frame(win)
+        txt_fr.pack(fill="both", expand=True, padx=10, pady=4)
+        sb = ttk.Scrollbar(txt_fr)
+        sb.pack(side="right", fill="y")
+        out = tk.Text(txt_fr, bg=ENTRY_BG, fg=HEADING_FG, font=("Consolas", 9),
+                      yscrollcommand=sb.set, relief="flat", state="disabled")
+        out.pack(fill="both", expand=True)
+        sb.config(command=out.yview)
+        out.tag_config("ok",   foreground="#a6e3a1")
+        out.tag_config("fail", foreground="#f38ba8")
+        out.tag_config("warn", foreground="#fab387")
+        out.tag_config("hdr",  foreground="#cba6f7", font=("Consolas", 9, "bold"))
+
+        btn_fr = ttk.Frame(win)
+        btn_fr.pack(fill="x", padx=10, pady=(4, 8))
+        failed_proxies: list[str] = []
+
+        def _append(text: str, tag: str = "") -> None:
+            out.config(state="normal")
+            out.insert("end", text, tag)
+            out.see("end")
+            out.config(state="disabled")
+
+        def _remove_failed() -> None:
+            good = [l for l in lines if l not in failed_proxies]
+            self._proxy_text.delete("1.0", "end")
+            self._proxy_text.insert("1.0", "\n".join(good))
+            _append(f"\n→ Da xoa {len(failed_proxies)} proxy loi, con lai {len(good)}\n", "warn")
+
+        btn_remove = tk.Button(btn_fr, text="Xoa proxy loi khoi danh sach",
+                               font=("Segoe UI", 8, "bold"), bg=BTN_STOP, fg=BTN_FG,
+                               relief="flat", padx=8, pady=2, cursor="hand2",
+                               command=_remove_failed, state="disabled")
+        btn_remove.pack(side="left")
+        sum_lbl = ttk.Label(btn_fr, text="", font=("Segoe UI", 8, "bold"))
+        sum_lbl.pack(side="left", padx=(12, 0))
+
+        # ── Worker test 1 proxy ────────────────────────────────────────────
+        _TEST_URL = "https://api.ipify.org?format=json"
+        _TIMEOUT  = 12  # giay
+
+        def _check_one(line: str) -> dict:
+            parsed = wk._parse_proxy(line)
+            if not parsed:
+                return {"line": line, "ok": False, "reason": "Format proxy sai"}
+            proxies_cfg = {"http://": parsed["server"], "https://": parsed["server"]}
+            auth = None
+            if parsed.get("username"):
+                auth = httpx.BasicAuth(parsed["username"], parsed.get("password", ""))
+            t0 = _time.monotonic()
+            try:
+                with httpx.Client(proxies=proxies_cfg, auth=auth,
+                                  timeout=_TIMEOUT, verify=False,
+                                  follow_redirects=True) as client:
+                    resp = client.get(_TEST_URL)
+                elapsed_ms = int((_time.monotonic() - t0) * 1000)
+                if resp.status_code == 200:
+                    ip = resp.json().get("ip", "?")
+                    return {"line": line, "ok": True, "ip": ip, "ms": elapsed_ms}
+                else:
+                    return {"line": line, "ok": False, "reason": f"HTTP {resp.status_code}",
+                            "ms": int((_time.monotonic() - t0) * 1000)}
+            except httpx.ProxyError as e:
+                return {"line": line, "ok": False,
+                        "reason": f"Proxy loi: {str(e)[:60]}"}
+            except httpx.TimeoutException:
+                return {"line": line, "ok": False, "reason": f"Timeout {_TIMEOUT}s"}
+            except Exception as e:
+                return {"line": line, "ok": False, "reason": str(e)[:80]}
+
+        # ── Chay trong background thread ──────────────────────────────────
+        def _run():
+            n_ok = n_fail = 0
+            seen_ips: dict[str, int] = {}  # ip → count (phat hien IP trung)
+
+            _append(f"{'SỐ':>4}  {'PROXY':<30}  {'TRẠNG THÁI'}\n", "hdr")
+            _append(f"{'─'*70}\n", "hdr")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+                futs = {pool.submit(_check_one, l): (i + 1, l) for i, l in enumerate(lines)}
+                for fut in concurrent.futures.as_completed(futs):
+                    idx, raw_line = futs[fut]
+                    try:
+                        res = fut.result()
+                    except Exception as e:
+                        res = {"line": raw_line, "ok": False, "reason": str(e)}
+
+                    short = raw_line[:28] + ".." if len(raw_line) > 30 else raw_line
+                    if res["ok"]:
+                        n_ok += 1
+                        ip = res["ip"]
+                        ms = res["ms"]
+                        dup_warn = ""
+                        seen_ips[ip] = seen_ips.get(ip, 0) + 1
+                        if seen_ips[ip] > 1:
+                            dup_warn = f"  ⚠ IP trung ({seen_ips[ip]} proxy cung IP)"
+                        row = f"{idx:>4}  {short:<30}  ✓ OK  {ms:>5}ms  IP={ip}{dup_warn}\n"
+                        tag = "warn" if dup_warn else "ok"
+                        win.after(0, lambda r=row, t=tag: _append(r, t))
+                    else:
+                        n_fail += 1
+                        failed_proxies.append(raw_line)
+                        reason = res.get("reason", "?")
+                        row = f"{idx:>4}  {short:<30}  ✗ FAIL  {reason}\n"
+                        win.after(0, lambda r=row: _append(r, "fail"))
+
+                    total_done = n_ok + n_fail
+                    win.after(0, lambda d=total_done: hdr.config(
+                        text=f"Da test {d}/{len(lines)}..."))
+
+            # Tong ket
+            dup_ip_count = sum(1 for c in seen_ips.values() if c > 1)
+            sum_text = (f"Tong ket: ✓ {n_ok} OK  |  ✗ {n_fail} Fail  |"
+                        f"  {dup_ip_count} IP bi trung")
+            win.after(0, lambda: _append(f"\n{'─'*70}\n", "hdr"))
+            win.after(0, lambda: _append(sum_text + "\n", "ok" if n_fail == 0 else "warn"))
+            win.after(0, lambda: hdr.config(text=sum_text))
+            win.after(0, lambda: sum_lbl.config(text=sum_text))
+            win.after(0, lambda: btn_remove.config(
+                state="normal" if failed_proxies else "disabled"))
+            self.root.after(0, lambda: self._proxy_status_lbl.config(
+                text=f"OK: {n_ok} | Fail: {n_fail} / {len(lines)}"))
+            self.root.after(0, lambda: self._btn_test_proxy.config(state="normal"))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     # ── Profile card ───────────────────────────────────────────────────────────
 
@@ -506,12 +725,14 @@ class GuiApp:
 
     def _update_profile_progress(self, key: str, success: int, target: int) -> None:
         for r in self._key_rows:
-            if r["name_var"].get().strip() == key:
+            ck = f"{r['name_var'].get().strip()}::{r['host_var'].get().strip()}"
+            if ck == key:
                 try:
                     original_target = int(r["target_var"].get())
                 except Exception:
                     original_target = target
-                total_success = self.db.get_success_count(key)
+                nm_part, host_part = key.split("::", 1)
+                total_success = self.db.get_success_count(nm_part, website=host_part)
                 r["prog_lbl"].config(text=f"{total_success}/{original_target}")
                 break
 
@@ -796,16 +1017,18 @@ class GuiApp:
             nm = p.get("name", "").strip()
             if not nm:
                 continue
+            host = p.get("host", "").strip()
+            ck = f"{nm}::{host}"  # composite key — phân biệt profile cùng tên khác website
             try:
                 t = int(p.get("target", 5))
             except Exception:
                 t = 5
-            kts.append((nm, max(1, t)))
-            pools[nm] = [ln.strip() for ln in p.get("comments", []) if ln.strip()]
-            profiles[nm] = wk.SessionProfile(
+            kts.append((ck, max(1, t)))
+            pools[ck] = [ln.strip() for ln in p.get("comments", []) if ln.strip()]
+            profiles[ck] = wk.SessionProfile(
                 name=nm,
                 email=p.get("email", "").strip(),
-                host=p.get("host", "").strip(),
+                host=host,
             )
 
         if not kts:
@@ -820,10 +1043,14 @@ class GuiApp:
 
         urls = self._urls_for_session.copy()
 
-        # ── Resume: loai bo URL da thanh cong, tru target da dat ──
+        # ── Resume trong CUNG group: chi loai bo URL ma CHINH group nay da thanh cong ──
+        # Group khac la session doc lap — khong ke ket qua cua group truoc
         done_urls: set[str] = set()
         cursor = self.db.conn.cursor()
-        cursor.execute("SELECT url FROM results WHERE status = 'SUCCESS' OR status = 'MODERATION'")
+        cursor.execute(
+            "SELECT url FROM results WHERE (status = 'SUCCESS' OR status = 'MODERATION') AND group_name = ?",
+            (group_name,)
+        )
         for row in cursor.fetchall():
             done_urls.add(row[0])
 
@@ -833,7 +1060,8 @@ class GuiApp:
         adjusted_kts: list[tuple[str, int]] = []
         existing_success: dict[str, int] = {}
         for k, t in kts:
-            already = self.db.get_success_count(k, group_name=group_name)
+            nm_part, host_part = k.split("::", 1)
+            already = self.db.get_success_count(nm_part, group_name=group_name, website=host_part)
             existing_success[k] = already
             remaining = max(0, t - already)
             adjusted_kts.append((k, remaining))
@@ -862,6 +1090,11 @@ class GuiApp:
         self._progress_lbl.config(text=f"{grp_label} — 0 / {self._total_jobs}")
         self._grp_label = grp_label
 
+        # Parse proxy list tu UI
+        _proxy_raw = self._proxy_text.get("1.0", "end-1c").strip()
+        _proxy_lines = [l.strip() for l in _proxy_raw.splitlines() if l.strip()] if _proxy_raw else None
+        _proxy_rotate = self._proxy_rotate_var.get()
+
         self._stop_event_holder.clear()
 
         def _thread_target():
@@ -873,6 +1106,8 @@ class GuiApp:
                     stop_event_holder=self._stop_event_holder,
                     bypass_name=self._bypass_name_var.get(),
                     group_name=group_name,
+                    proxies=_proxy_lines,
+                    proxy_rotate_every=_proxy_rotate,
                 )
             except Exception as exc:
                 import traceback
@@ -910,6 +1145,23 @@ class GuiApp:
         idx = getattr(self, "_running_group_idx", 0)
         prev_name = getattr(self, "_running_group_name", "")
 
+        # ── Cleanup thread + scheduler cu truoc khi chay group moi ──
+        old_thread = self._session_thread
+        if old_thread is not None and old_thread.is_alive():
+            old_thread.join(timeout=15)
+        self._session_thread = None
+
+        old_sched = self._scheduler
+        if old_sched is not None:
+            try:
+                old_sched.db.close()
+            except Exception:
+                pass
+        self._scheduler = None
+
+        import gc
+        gc.collect()
+
         next_idx = idx + 1
         if next_idx < len(group_queue):
             # Co group tiep theo
@@ -922,8 +1174,8 @@ class GuiApp:
             self._running_group_idx = next_idx
             self._running_group_name = group_queue[next_idx]["name"]
             self._progress_lbl.config(
-                text=f"Cho 10s → Group tiep theo: {group_queue[next_idx]['name']}...")
-            self.root.after(10000, lambda: self._start_group(next_idx))
+                text=f"Cho 30s → Group tiep theo: {group_queue[next_idx]['name']}...")
+            self.root.after(30000, lambda: self._start_group(next_idx))
         else:
             # Het groups
             self._btn_start.config(state="normal")
@@ -942,7 +1194,7 @@ class GuiApp:
             rows = self.db.get_success_results(group_name=group_name)
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 w = csv.writer(f)
-                w.writerow(["profile", "url_goc", "link_thanh_cong", "status"])
+                w.writerow(["profile", "url_goc", "link_thanh_cong", "status", "comment_used", "website"])
                 w.writerows(rows)
             print(f"[CSV] Exported {len(rows)} rows → {path}")
         except Exception as exc:
@@ -992,10 +1244,12 @@ class GuiApp:
             return
 
         key = r.key or "?"
+        db_key = key.split("::")[0] if "::" in key else key  # strip composite — lưu tên gốc vào DB
 
         if r.status in (wk.STATUS_SUCCESS, wk.STATUS_MODERATION):
-            self.db.add_result(key, r.url, r.comment_link or "", r.status,
-                               group_name=r.group_name, comment_used=r.comment_used)
+            self.db.add_result(db_key, r.url, r.comment_link or "", r.status,
+                               group_name=r.group_name, comment_used=r.comment_used,
+                               website=r.host)
             self._refresh_success()
             return
 
@@ -1003,8 +1257,9 @@ class GuiApp:
         if r.error_detail:
             reason += f" - {r.error_detail}"
 
-        self.db.add_result(key, r.url, r.comment_used or "", reason,
-                           group_name=r.group_name, comment_used=r.comment_used)
+        self.db.add_result(db_key, r.url, r.comment_used or "", reason,
+                           group_name=r.group_name, comment_used=r.comment_used,
+                           website=r.host)
         self._refresh_fail()
 
     # ═══════════════════════════════════════════════════════════════
@@ -1024,7 +1279,7 @@ class GuiApp:
         rows = self.db.get_success_results(sel, group_name=grp)
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
-            w.writerow(["profile", "url_goc", "link_thanh_cong", "status"])
+            w.writerow(["profile", "url_goc", "link_thanh_cong", "status", "comment_used", "website"])
             w.writerows(rows)
         messagebox.showinfo("Export", f"Da luu {len(rows)} dong.")
 
@@ -1378,12 +1633,15 @@ class GuiApp:
             self._groups[self._current_group_view]["profiles"] = self._collect_current_profiles()
 
         urls = "\n".join(self._urls_list)
+        proxy_text = self._proxy_text.get("1.0", "end-1c").strip()
         return {
             "groups": self._groups,
             "urls": urls,
             "headless": self._headless_var.get(),
             "workers":  self._worker_var.get(),
             "bypass_name": self._bypass_name_var.get(),
+            "proxies": proxy_text,
+            "proxy_rotate_every": self._proxy_rotate_var.get(),
         }
 
     def _save_state(self) -> None:
@@ -1445,6 +1703,16 @@ class GuiApp:
             except Exception:
                 pass
 
+            # Restore proxy config
+            proxy_text = state.get("proxies", "")
+            if proxy_text:
+                self._proxy_text.delete("1.0", "end")
+                self._proxy_text.insert("1.0", proxy_text)
+            try:
+                self._proxy_rotate_var.set(int(state.get("proxy_rotate_every", 250)))
+            except Exception:
+                pass
+
             total_profiles = sum(len(g.get("profiles", [])) for g in self._groups)
             print(f"[gui] Da tai state: {len(self._groups)} groups, "
                   f"{total_profiles} profiles, {len(urls)} chars URLs")
@@ -1460,6 +1728,26 @@ class GuiApp:
         self.db.clear_results()
         self._refresh_success()
         self._refresh_fail()
+
+    def _reset_all_url_data(self) -> None:
+        """Xoá toàn bộ results + reset queue → PENDING. Giữ nguyên config group/comment."""
+        if not messagebox.askyesno(
+            "XOÁ TẤT CẢ?",
+            "Hành động này sẽ:\n"
+            "  • Xoá toàn bộ kết quả (SUCCESS, FAILED, MODERATION)\n"
+            "  • Reset tất cả URL trong queue về PENDING\n"
+            "  • Xoá domain cooldown\n\n"
+            "Cấu hình group, comment, proxy KHÔNG bị xoá.\n"
+            "Tool sẽ chạy lại từ đầu với danh sách URL hiện tại.\n\n"
+            "Tiếp tục?",
+        ):
+            return
+        self.db.reset_all_url_data()
+        self._refresh_success()
+        self._refresh_fail()
+        self._progressbar["value"] = 0
+        self._progress_lbl.config(text="")
+        messagebox.showinfo("Đã reset", "Đã xoá toàn bộ kết quả và reset URL về PENDING.\nBấm Bắt đầu để chạy lại từ đầu.")
 
     # ═══════════════════════════════════════════════════════════════
     # TAB 5 — Gen Comment (Groq AI)
@@ -1841,6 +2129,179 @@ class GuiApp:
         messagebox.showinfo(
             "Da them",
             f"Da them {count} profile ({total_cmts} comment) vao {group_name}.")
+
+    # ═══════════════════════════════════════════════════════════════
+    # TAB 6 — Log viewer
+    # ═══════════════════════════════════════════════════════════════
+
+    def _build_tab6(self) -> None:
+        self._tab6.columnconfigure(0, weight=1)
+        self._tab6.rowconfigure(1, weight=1)
+
+        # ── Toolbar ──
+        bar = ttk.Frame(self._tab6)
+        bar.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 2))
+
+        ttk.Label(bar, text="Level:", font=("Segoe UI", 9)).pack(side="left")
+        self._log_level_var = tk.StringVar(value="INFO")
+        level_cb = ttk.Combobox(
+            bar, textvariable=self._log_level_var,
+            values=["DEBUG", "INFO", "WARNING", "ERROR"],
+            state="readonly", width=9,
+        )
+        level_cb.pack(side="left", padx=(4, 16))
+        level_cb.bind("<<ComboboxSelected>>", lambda _: self._apply_log_level())
+
+        self._log_autoscroll_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            bar, text="Auto-scroll",
+            variable=self._log_autoscroll_var,
+        ).pack(side="left", padx=(0, 16))
+
+        self._log_filter_var = tk.StringVar()
+        ttk.Label(bar, text="Filter:", font=("Segoe UI", 9)).pack(side="left")
+        filter_entry = ttk.Entry(bar, textvariable=self._log_filter_var, width=20)
+        filter_entry.pack(side="left", padx=(4, 16))
+        filter_entry.bind("<Return>", lambda _: self._log_apply_filter())
+        ttk.Button(bar, text="Apply", command=self._log_apply_filter).pack(side="left", padx=(0, 16))
+
+        tk.Button(
+            bar, text="Clear",
+            font=("Segoe UI", 8, "bold"), bg=ENTRY_BG, fg=HEADING_FG,
+            relief="flat", padx=8, pady=2, cursor="hand2",
+            command=self._log_clear,
+        ).pack(side="left", padx=(0, 8))
+
+        tk.Button(
+            bar, text="Save to file",
+            font=("Segoe UI", 8, "bold"), bg=ENTRY_BG, fg=HEADING_FG,
+            relief="flat", padx=8, pady=2, cursor="hand2",
+            command=self._log_save,
+        ).pack(side="left")
+
+        self._log_count_lbl = ttk.Label(bar, text="0 dong", font=("Segoe UI", 8))
+        self._log_count_lbl.pack(side="right", padx=(0, 8))
+
+        # ── Text area ──
+        txt_fr = ttk.Frame(self._tab6)
+        txt_fr.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        txt_fr.rowconfigure(0, weight=1)
+        txt_fr.columnconfigure(0, weight=1)
+
+        vsb = ttk.Scrollbar(txt_fr, orient="vertical")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb = ttk.Scrollbar(txt_fr, orient="horizontal")
+        hsb.grid(row=1, column=0, sticky="ew")
+
+        self._log_text = tk.Text(
+            txt_fr,
+            bg=ENTRY_BG, fg=HEADING_FG,
+            font=("Consolas", 9),
+            wrap="none",
+            state="disabled",
+            yscrollcommand=vsb.set,
+            xscrollcommand=hsb.set,
+        )
+        self._log_text.grid(row=0, column=0, sticky="nsew")
+        vsb.config(command=self._log_text.yview)
+        hsb.config(command=self._log_text.xview)
+
+        # Color tags per level
+        self._log_text.tag_config("DEBUG",   foreground="#585b70")  # muted grey
+        self._log_text.tag_config("INFO",    foreground="#89b4fa")  # blue
+        self._log_text.tag_config("WARNING", foreground="#fab387")  # orange
+        self._log_text.tag_config("ERROR",   foreground="#f38ba8")  # red
+        self._log_text.tag_config("CRITICAL",foreground="#f38ba8", font=("Consolas", 9, "bold"))
+
+        self._log_lines: list[tuple[str, str]] = []  # (level, text)
+        self._log_line_count = 0
+        self._LOG_MAX_LINES = 5000  # giu toi da de tranh an RAM
+
+    def _attach_log_handler(self) -> None:
+        """Gan GuiLogHandler vao logger 'atc' — forward tat ca log len Tab 6."""
+        handler = _GuiLogHandler(self._append_log_line)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s [W%(thread)d] %(levelname)-8s %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        handler.setLevel(logging.DEBUG)
+        atc_log = logging.getLogger("atc")
+        atc_log.setLevel(logging.DEBUG)
+        atc_log.addHandler(handler)
+        self._gui_log_handler = handler
+
+    def _apply_log_level(self) -> None:
+        level_str = self._log_level_var.get()
+        level = getattr(logging, level_str, logging.INFO)
+        if hasattr(self, "_gui_log_handler"):
+            self._gui_log_handler.setLevel(level)
+
+    def _append_log_line(self, level: str, text: str) -> None:
+        """Goi tu handler (background thread) — schedule ve main thread."""
+        self.root.after(0, self._write_log_line, level, text)
+
+    def _write_log_line(self, level: str, text: str) -> None:
+        """Them 1 dong vao log text widget (main thread)."""
+        # Trim khi qua gioi han
+        if self._log_line_count >= self._LOG_MAX_LINES:
+            self._log_text.config(state="normal")
+            self._log_text.delete("1.0", "501.0")  # xoa 500 dong dau
+            self._log_line_count -= 500
+            self._log_lines = self._log_lines[500:]
+            self._log_text.config(state="disabled")
+
+        self._log_lines.append((level, text))
+        self._log_line_count += 1
+
+        # Kiem tra filter
+        flt = self._log_filter_var.get().strip().lower()
+        if flt and flt not in text.lower():
+            return
+
+        self._log_text.config(state="normal")
+        self._log_text.insert("end", text + "\n", level)
+        self._log_text.config(state="disabled")
+
+        if self._log_autoscroll_var.get():
+            self._log_text.see("end")
+
+        self._log_count_lbl.config(text=f"{self._log_line_count} dong")
+
+    def _log_apply_filter(self) -> None:
+        """Re-render toan bo log voi filter hien tai."""
+        flt = self._log_filter_var.get().strip().lower()
+        self._log_text.config(state="normal")
+        self._log_text.delete("1.0", "end")
+        for level, text in self._log_lines:
+            if flt and flt not in text.lower():
+                continue
+            self._log_text.insert("end", text + "\n", level)
+        self._log_text.config(state="disabled")
+        if self._log_autoscroll_var.get():
+            self._log_text.see("end")
+
+    def _log_clear(self) -> None:
+        self._log_lines.clear()
+        self._log_line_count = 0
+        self._log_text.config(state="normal")
+        self._log_text.delete("1.0", "end")
+        self._log_text.config(state="disabled")
+        self._log_count_lbl.config(text="0 dong")
+
+    def _log_save(self) -> None:
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text file", "*.txt"), ("All files", "*.*")],
+            title="Luu log ra file",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                for _, text in self._log_lines:
+                    f.write(text + "\n")
+        except Exception as exc:
+            messagebox.showerror("Loi", f"Khong luu duoc: {exc}")
 
     # ── Common helpers ─────────────────────────────────────────────────────────
 

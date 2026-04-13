@@ -8,6 +8,12 @@ class DBManager:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self._init_db()
 
+    def close(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
     def _init_db(self):
         # Bảng chứa URL chờ chạy
         self.conn.execute('''CREATE TABLE IF NOT EXISTS queue
@@ -23,6 +29,7 @@ class DBManager:
             ("indexed", "INTEGER DEFAULT 0"),
             ("group_name", "TEXT DEFAULT ''"),
             ("comment_used", "TEXT DEFAULT ''"),
+            ("website", "TEXT DEFAULT ''"),
         ]:
             try:
                 self.conn.execute(f"ALTER TABLE results ADD COLUMN {col} {definition}")
@@ -37,6 +44,8 @@ class DBManager:
 
         # Reset các URL bị kẹt (Tắt tool đột ngột) về lại PENDING
         self.conn.execute("UPDATE queue SET status = 'PENDING' WHERE status = 'PROCESSING'")
+        # Reset FAILED để retry ở session mới (SUCCESS giữ nguyên — không chạy lại URL đã comment thành công)
+        self.conn.execute("UPDATE queue SET status = 'PENDING' WHERE status = 'FAILED'")
         self.conn.commit()
 
     def add_urls(self, urls: list[str]):
@@ -72,15 +81,15 @@ class DBManager:
             return job_id, url
         return None, None
 
-    def add_result(self, keyword, url, comment_link, status, group_name="", comment_used=""):
+    def add_result(self, keyword, url, comment_link, status, group_name="", comment_used="", website=""):
         cursor = self.conn.cursor()
         cursor.execute('''
-            INSERT INTO results (keyword, url, comment_link, status, group_name, comment_used)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (keyword, url, comment_link, status, group_name, comment_used))
+            INSERT INTO results (keyword, url, comment_link, status, group_name, comment_used, website)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (keyword, url, comment_link, status, group_name, comment_used, website))
         self.conn.commit()
 
-    def get_success_count(self, keyword=None, group_name=None):
+    def get_success_count(self, keyword=None, group_name=None, website=None):
         cursor = self.conn.cursor()
         conditions = ["(status = 'SUCCESS' OR status = 'MODERATION')"]
         params = []
@@ -90,6 +99,9 @@ class DBManager:
         if group_name and group_name != "Tat ca":
             conditions.append("group_name = ?")
             params.append(group_name)
+        if website:
+            conditions.append("website = ?")
+            params.append(website)
         cursor.execute(f"SELECT COUNT(*) FROM results WHERE {' AND '.join(conditions)}", params)
         return cursor.fetchone()[0]
 
@@ -116,7 +128,8 @@ class DBManager:
         if group_name and group_name != "Tat ca":
             conditions.append("group_name = ?")
             params.append(group_name)
-        cursor.execute(f"SELECT keyword, url, comment_link, status FROM results WHERE {' AND '.join(conditions)}", params)
+        cursor.execute(f"SELECT keyword, url, comment_link, status, comment_used, website FROM results WHERE {' AND '.join(conditions)}", params)
+
         return cursor.fetchall()
     
     def get_fail_results(self, keyword=None, limit=500, group_name=None):
@@ -135,6 +148,14 @@ class DBManager:
 
     def clear_results(self):
         self.conn.execute("DELETE FROM results")
+        self.conn.commit()
+
+    def reset_all_url_data(self):
+        """Xoá toàn bộ results + reset mọi queue → PENDING + xoá domain cooldown.
+        Config group/comment/profile KHÔNG bị ảnh hưởng."""
+        self.conn.execute("DELETE FROM results")
+        self.conn.execute("UPDATE queue SET status = 'PENDING'")
+        self.conn.execute("DELETE FROM domain_stats")
         self.conn.commit()
 
     # ── Multi-Group helpers ───────────────────────────────────────

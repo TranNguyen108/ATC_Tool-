@@ -85,6 +85,7 @@ class Result:
     strategy: str = ""              # layer nao detect duoc form
     key: str = ""                   # keyword dang chay (de GUI hien thi per-key)
     group_name: str = ""            # ten group (multi-group)
+    host: str = ""                  # website cua profile (phan biet profile cung key)
     # Chi dung khi status == STATUS_CAPTCHA:
     captcha_event: Optional[asyncio.Event] = field(default=None, repr=False)
     captcha_loop: Optional[asyncio.AbstractEventLoop] = field(default=None, repr=False)
@@ -175,6 +176,8 @@ class JobScheduler:
         self._inflight: dict[str, tuple[str, str]] = {}  # url -> (comment, key)
         # dem so lan watchdog phuc hoi moi URL — qua gioi han → FAILED vinh vien
         self._url_recover_count: dict[str, int] = {}
+        # dem so lan URL fail thuong (khong phai watchdog) — qua gioi han → khong retry nua
+        self._url_fail_count: dict[str, int] = {}
 
     # --- public -------------------------------------------------------
 
@@ -236,10 +239,28 @@ class JobScheduler:
         with self._lock:
             self._success[key] += 1
 
-    def finalize_job(self, url: str) -> None:
-        """Xoa URL khoi danh sach in-flight sau khi hoan thanh (thanh cong hoac that bai)."""
+    def finalize_job(self, url: str, success: bool = False) -> None:
+        """Xoa URL khoi danh sach in-flight sau khi hoan thanh (thanh cong hoac that bai).
+        Neu that bai va chua vuot gioi han retry, reset URL ve PENDING de thu lai."""
         with self._lock:
             self._inflight.pop(url, None)
+            if success:
+                # Danh dau da chay xong — khong bao gio chay lai trong session nay
+                self.db.conn.execute(
+                    "UPDATE queue SET status = 'SUCCESS' WHERE url = ?", (url,))
+                self.db.conn.commit()
+            else:
+                count = self._url_fail_count.get(url, 0) + 1
+                self._url_fail_count[url] = count
+                if count <= _MAX_URL_FAIL_RETRIES:
+                    self.db.conn.execute(
+                        "UPDATE queue SET status = 'PENDING', priority = -1 WHERE url = ?", (url,))
+                    self.db.conn.commit()
+                else:
+                    # Het retry — danh dau FAILED de khoi dong lai session moi se reset ve PENDING
+                    self.db.conn.execute(
+                        "UPDATE queue SET status = 'FAILED' WHERE url = ?", (url,))
+                    self.db.conn.commit()
 
     def recover_inflight(self) -> tuple[int, list[tuple[str, str, str]]]:
         """Phuc hoi URL dang in-flight ve hang doi (goi sau watchdog).
@@ -295,20 +316,18 @@ class JobScheduler:
         with self._lock:
             cursor = self.db.conn.execute("SELECT COUNT(*) FROM queue WHERE status = 'PENDING'")
             pending_db = cursor.fetchone()[0]
-            # Chi tra ve True khi ko con url trong queue VA ko con url in-flight
-            if pending_db == 0 and len(self._inflight) == 0:
-                return True
-                
-            all_targets_met = True
-            for key, target in self._keys:
-                if self._success.get(key, 0) < target:
-                    all_targets_met = False
-                    if pending_db > 0:
-                        return False
-            
+            all_targets_met = all(
+                self._success.get(k, 0) >= t for k, t in self._keys
+            )
+
+            # Tat ca target da du → done
             if all_targets_met and len(self._inflight) == 0:
                 return True
-                
+
+            # Het URL PENDING va het in-flight → khong con gi de lam
+            if pending_db == 0 and len(self._inflight) == 0:
+                return True
+
             return False
 
     def done_count(self) -> int:
@@ -439,15 +458,15 @@ async def _handle_rating(page: Page, form_result) -> None:
             await form_result.f_rating.click(timeout=3000)
 
         elif form_result.rating_type == "stars_click":
-            await form_result.f_rating.click(timeout=3000)
-            await asyncio.sleep(0.3)
-            # WooCommerce stars: click lan 2 neu can confirm
+            # WooCommerce ẩn .stars a bằng CSS display:none — dùng JS dispatch để bypass visibility check.
             try:
-                active = page.locator(".comment-form-rating .stars a.active, p.stars a.active").first
-                if not await active.is_visible(timeout=500):
-                    await form_result.f_rating.click(timeout=2000)
+                await form_result.f_rating.dispatch_event("click")
             except Exception:
-                pass
+                try:
+                    await form_result.f_rating.evaluate("el => el.click()")
+                except Exception:
+                    pass
+            await asyncio.sleep(0.3)
 
         elif form_result.rating_type == "select_text":
             best_val = await form_result.f_rating.evaluate("""el => {
@@ -598,6 +617,141 @@ async def handle_cookie_popup(page: Page) -> bool:
 # Timeout cho toàn bộ 1 URL (giây). Nếu quá thì force-kill.
 _URL_TIMEOUT = 60
 _MAX_URL_RECOVERIES = 3   # URL bi watchdog phuc hoi qua so lan nay → FAILED han
+_MAX_URL_FAIL_RETRIES = 3  # URL fail thuong duoc retry toi da so lan nay truoc khi bo
+
+# ─────────────────────────────────────────────
+# Proxy helpers
+# ─────────────────────────────────────────────
+
+def _parse_proxy(raw: str) -> dict:
+    """Parse proxy string thanh Playwright proxy dict.
+    Format chinh:  ip:port:user:password  (vi du: 1.2.3.4:8080:myuser:mypass)
+    Also supports: host:port | user:pass@host:port | socks5://...
+    Tra ve {} neu raw rong hoac khong hop le.
+    """
+    raw = raw.strip()
+    if not raw:
+        return {}
+
+    # Detect protocol prefix
+    protocol = "http"
+    for prefix in ("socks5://", "socks4://", "http://", "https://"):
+        if raw.lower().startswith(prefix):
+            protocol = prefix.rstrip(":/")
+            raw = raw[len(prefix):]
+            break
+
+    username = password = None
+
+    # Format chinh: ip:port:user:password (4 phan cach boi ':')
+    if "@" not in raw:
+        parts = raw.split(":")
+        if len(parts) == 4:
+            host, port, username, password = parts
+            if not host or not port.isdigit():
+                return {}
+            result: dict = {"server": f"{protocol}://{host}:{port}"}
+            if username and password:
+                result["username"] = username
+                result["password"] = password
+            return result
+
+    # Fallback: user:pass@host:port
+    if "@" in raw:
+        auth, hostport = raw.rsplit("@", 1)
+        if ":" in auth:
+            username, password = auth.split(":", 1)
+    else:
+        hostport = raw
+
+    # Validate host:port (chi 2 phan)
+    hp_parts = hostport.rsplit(":", 1)
+    if len(hp_parts) != 2:
+        return {}
+    host, port = hp_parts
+    if not host or not port.isdigit():
+        return {}
+
+    result = {"server": f"{protocol}://{host}:{port}"}
+    if username and password:
+        result["username"] = username
+        result["password"] = password
+    return result
+
+
+class ProxyPool:
+    """Quan ly pool proxy: gan proxy cho worker theo batch, auto-rotate, failover."""
+
+    def __init__(self, proxies: list[str], workers_per_batch: int = 5,
+                 rotate_every: int = 250) -> None:
+        self._parsed: list[dict] = [_parse_proxy(p) for p in proxies if _parse_proxy(p)]
+        self._raw: list[str] = [p.strip() for p in proxies if _parse_proxy(p.strip())]
+        self._n: int = len(self._parsed)
+        self._workers_per_batch = workers_per_batch
+        self._rotate_every = rotate_every
+        self._batch_offset: int = 0
+        self._success_count: int = 0
+        self._failed: set[int] = set()
+        self._lock = threading.Lock()
+
+    # --- public -------------------------------------------------------
+
+    def get_proxy(self, worker_id: int) -> dict | None:
+        """Tra ve proxy dict cho worker_id, skip proxy da bi danh dau loi.
+        Tra ve None neu khong co proxy hoac tat ca da loi."""
+        if self._n == 0:
+            return None
+        with self._lock:
+            idx = (self._batch_offset + worker_id) % self._n
+            # Tim proxy chua bi failed (quay toi da 1 vong)
+            for _ in range(self._n):
+                if idx not in self._failed:
+                    return self._parsed[idx]
+                idx = (idx + 1) % self._n
+            return None  # tat ca proxy da loi
+
+    def on_success(self) -> bool:
+        """Ghi nhan 1 success. Tra ve True neu can rotate batch."""
+        with self._lock:
+            self._success_count += 1
+            if self._success_count >= self._rotate_every:
+                self._success_count = 0
+                self._batch_offset = (self._batch_offset + self._workers_per_batch) % self._n
+                log.info(f"[PROXY] Rotate batch — offset={self._batch_offset}, "
+                         f"next proxies: {self.current_batch_info()}")
+                return True
+            return False
+
+    def skip_proxy(self, worker_id: int) -> None:
+        """Danh dau proxy cua worker nay la loi — lan sau get_proxy se bo qua."""
+        with self._lock:
+            idx = (self._batch_offset + worker_id) % self._n
+            self._failed.add(idx)
+            remaining = self._n - len(self._failed)
+            log.warning(f"[PROXY] Proxy #{idx} ({self._raw[idx]}) bi loi — "
+                        f"con {remaining}/{self._n} proxy kha dung")
+
+    def has_proxies(self) -> bool:
+        return self._n > 0 and len(self._failed) < self._n
+
+    def current_batch_info(self) -> str:
+        """Tra ve chuoi mo ta batch hien tai (de log)."""
+        if self._n == 0:
+            return "no proxies"
+        parts = []
+        for i in range(self._workers_per_batch):
+            idx = (self._batch_offset + i) % self._n
+            status = "X" if idx in self._failed else "OK"
+            parts.append(f"W{i}→p{idx}({status})")
+        return " | ".join(parts)
+
+    @property
+    def success_count(self) -> int:
+        return self._success_count
+
+    @property
+    def rotate_every(self) -> int:
+        return self._rotate_every
 
 # Track context dang active theo worker ID — de force-close khi timeout/cancel
 _active_contexts: dict[int, BrowserContext] = {}
@@ -669,6 +823,7 @@ async def _process_url(
     bypass_name: bool = False,
     worker_id: int = 0,
     group_name: str = "",
+    proxy: dict | None = None,
 ) -> str:
     """
     Xu ly 1 URL. Tra ve final_status (STATUS_*) de caller cap nhat scheduler.
@@ -677,15 +832,19 @@ async def _process_url(
     t0 = time.monotonic()
     context: Optional[BrowserContext] = None
     page: Optional[Page] = None  # khoi tao truoc try — tranh UnboundLocalError trong finally
+    _host = profile.host          # capture de gan vao moi Result
     try:
         ua, extra_headers = _get_random_ua_headers()
-        context = await browser.new_context(
+        ctx_kwargs: dict = dict(
             user_agent=ua,
             extra_http_headers=extra_headers,
             viewport={"width": random.randint(1280, 1440), "height": random.randint(768, 900)},
             locale="vi-VN",
             timezone_id="Asia/Ho_Chi_Minh",
         )
+        if proxy:
+            ctx_kwargs["proxy"] = proxy
+        context = await browser.new_context(**ctx_kwargs)
         _active_contexts[worker_id] = context
         page = await context.new_page()
 
@@ -729,78 +888,13 @@ async def _process_url(
                     url=url, status=STATUS_NO_FORM, key=key,
                     comment_used=comment, comment_link=url,
                     error_detail="Trang khong phan hoi (timeout 30s)",
-                    group_name=group_name,
+                    group_name=group_name, host=_host,
                 ))
                 return STATUS_NO_FORM
 
         # ── Check stop event giữa các bước ──
         if stop_event and stop_event.is_set():
             return STATUS_REVIEW
-
-        # Cào Title hoặc H1
-        article_title = ""
-        try:
-            article_title = await page.locator("h1").first.inner_text(timeout=2000)
-        except:
-            try:
-                article_title = await page.title()
-            except: pass
-
-        # Nếu cào được tiêu đề, gọi Groq AI sinh comment Realtime
-        if article_title and len(article_title) > 5:
-            def is_vietnamese(text: str) -> bool:
-                vn_chars = "áàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ"
-                text_lower = text.lower()
-                return any(c in text_lower for c in vn_chars) or "nhà cái" in text_lower or "cá cược" in text_lower
-
-            # Cấu hình WEBTITLE (nếu có)
-            webtitle = ""
-            try:
-                import comment_gen
-                if comment_gen.ENV_FILE.exists():
-                    env_text = comment_gen.ENV_FILE.read_text(encoding="utf-8")
-                    for line in env_text.splitlines():
-                        if line.startswith("WEBTITLE="):
-                            webtitle = line.partition("=")[2].strip()
-            except Exception:
-                pass
-            
-            domain_hint = webtitle if webtitle else "giải trí, cá cược, trò chơi trực tuyến"
-            is_vn = is_vietnamese(key)
-            
-            if is_vn:
-                sys_prompt = "Bạn là người đọc blog để lại bình luận tự nhiên."
-                usr_prompt = (
-                    f"Tôi đang đọc bài blog: '{article_title}'. Viết 1 bình luận ngắn (dưới 40 từ) bằng tiếng Việt:\n"
-                    f"- Khen 1 điểm của bài, sau đó chuyển ý (dẫn dắt) để giới thiệu khéo léo về một dịch vụ có từ khóa tập trung là '{key}' (lĩnh vực chung: {domain_hint}).\n"
-                    f"QUY TẮC CỨNG:\n"
-                    f"1. KHÔNG được viết trực tiếp từ khóa '{key}' hay bất kỳ link nào vào bình luận vì sẽ bị trùng lặp. Hãy dùng từ nối như 'nền tảng này', 'website bên dưới', 'dịch vụ này'...\n"
-                    f"2. BẮT BUỘC kết thúc câu trả lời bằng đúng chuỗi văn bản [MY_LINK] (đây là nơi hệ thống sẽ tự động cắm link)."
-                )
-            else:
-                sys_prompt = "You are a natural blog reader leaving a comment."
-                usr_prompt = (
-                    f"I am reading the blog post: '{article_title}'. Write a short comment (under 40 words) in English:\n"
-                    f"- Praise a specific point from the post, then seamlessly transition to recommending a service with the main keyword '{key}' (overall domain/niche: {domain_hint}).\n"
-                    f"HARD RULES:\n"
-                    f"1. Do NOT write the keyword '{key}' or any URLs directly in your text to avoid repetition. Refer to it indirectly like 'this platform', 'this website', 'the service below'...\n"
-                    f"2. You MUST end your text with the exact placeholder [MY_LINK] (the system will inject the specific link there)."
-                )
-
-            dynamic_comment = await _call_groq_realtime(usr_prompt, sys_prompt)
-            if dynamic_comment:
-                # Thay thế placeholder [MY_LINK] bằng chính keyword/anchor mong muốn
-                if "[MY_LINK]" in dynamic_comment:
-                    if profile.host:
-                        comment = dynamic_comment.replace("[MY_LINK]", f"<a href=\"{profile.host}\">{key}</a>")
-                    else:
-                        comment = dynamic_comment.replace("[MY_LINK]", key)
-                else:
-                    # Fallback (AI quên in MY_LINK)
-                    if profile.host:
-                        comment = f"{dynamic_comment} <a href=\"{profile.host}\">{key}</a>"
-                    else:
-                        comment = f"{dynamic_comment} {key}"
 
         # ── 2. SCROLL + SETTLE — trigger lazy-load trước khi tìm form ──
         try:
@@ -875,7 +969,7 @@ async def _process_url(
                     url=url, status=STATUS_NO_FORM, key=key,
                     comment_used=comment, comment_link=url,
                     error_detail="Trang khong co form comment",
-                    group_name=group_name,
+                    group_name=group_name, host=_host,
                 ))
                 return STATUS_NO_FORM
         log.debug(f"[{key}] quick check form_hint={form_hint} — {time.monotonic()-t0:.1f}s")
@@ -965,7 +1059,7 @@ async def _process_url(
                 url=url, status=STATUS_NO_FORM, key=key,
                 comment_used=comment, comment_link=url,
                 error_detail="Khong tim thay comment form",
-                group_name=group_name,
+                group_name=group_name, host=_host,
             ))
             return STATUS_NO_FORM
         log.info(f"[{key}] FORM found strategy={form_result.strategy} — {time.monotonic()-t0:.1f}s")
@@ -977,9 +1071,72 @@ async def _process_url(
                 url=url, status=STATUS_CAPTCHA_FAILED, key=key,
                 comment_used=comment, comment_link=url,
                 error_detail="Captcha detected — skip",
-                group_name=group_name,
+                group_name=group_name, host=_host,
             ))
             return STATUS_CAPTCHA_FAILED
+
+        # ── 4a. Groq AI sinh comment dựa trên tiêu đề bài ──
+        # Chạy SAU khi đã xác nhận có form → không ăn vào budget timeout form detection.
+        article_title = ""
+        try:
+            article_title = await page.locator("h1").first.inner_text(timeout=2000)
+        except Exception:
+            try:
+                article_title = await page.title()
+            except Exception:
+                pass
+
+        if article_title and len(article_title) > 5:
+            def is_vietnamese(text: str) -> bool:
+                vn_chars = "áàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ"
+                text_lower = text.lower()
+                return any(c in text_lower for c in vn_chars) or "nhà cái" in text_lower or "cá cược" in text_lower
+
+            webtitle = ""
+            try:
+                import comment_gen
+                if comment_gen.ENV_FILE.exists():
+                    env_text = comment_gen.ENV_FILE.read_text(encoding="utf-8")
+                    for line in env_text.splitlines():
+                        if line.startswith("WEBTITLE="):
+                            webtitle = line.partition("=")[2].strip()
+            except Exception:
+                pass
+
+            domain_hint = webtitle if webtitle else "giải trí, cá cược, trò chơi trực tuyến"
+            is_vn = is_vietnamese(key)
+
+            if is_vn:
+                sys_prompt = "Bạn là người đọc blog để lại bình luận tự nhiên."
+                usr_prompt = (
+                    f"Tôi đang đọc bài blog: '{article_title}'. Viết 1 bình luận ngắn (dưới 40 từ) bằng tiếng Việt:\n"
+                    f"- Khen 1 điểm của bài, sau đó chuyển ý (dẫn dắt) để giới thiệu khéo léo về một dịch vụ có từ khóa tập trung là '{key}' (lĩnh vực chung: {domain_hint}).\n"
+                    f"QUY TẮC CỨNG:\n"
+                    f"1. KHÔNG được viết trực tiếp từ khóa '{key}' hay bất kỳ link nào vào bình luận vì sẽ bị trùng lặp. Hãy dùng từ nối như 'nền tảng này', 'website bên dưới', 'dịch vụ này'...\n"
+                    f"2. BẮT BUỘC kết thúc câu trả lời bằng đúng chuỗi văn bản [MY_LINK] (đây là nơi hệ thống sẽ tự động cắm link)."
+                )
+            else:
+                sys_prompt = "You are a natural blog reader leaving a comment."
+                usr_prompt = (
+                    f"I am reading the blog post: '{article_title}'. Write a short comment (under 40 words) in English:\n"
+                    f"- Praise a specific point from the post, then seamlessly transition to recommending a service with the main keyword '{key}' (overall domain/niche: {domain_hint}).\n"
+                    f"HARD RULES:\n"
+                    f"1. Do NOT write the keyword '{key}' or any URLs directly in your text to avoid repetition. Refer to it indirectly like 'this platform', 'this website', 'the service below'...\n"
+                    f"2. You MUST end your text with the exact placeholder [MY_LINK] (the system will inject the specific link there)."
+                )
+
+            dynamic_comment = await _call_groq_realtime(usr_prompt, sys_prompt)
+            if dynamic_comment:
+                if "[MY_LINK]" in dynamic_comment:
+                    if profile.host:
+                        comment = dynamic_comment.replace("[MY_LINK]", f"<a href=\"{profile.host}\">{key}</a>")
+                    else:
+                        comment = dynamic_comment.replace("[MY_LINK]", key)
+                else:
+                    if profile.host:
+                        comment = f"{dynamic_comment} <a href=\"{profile.host}\">{key}</a>"
+                    else:
+                        comment = f"{dynamic_comment} {key}"
 
         # ── Check stop event giữa các bước ──
         if stop_event and stop_event.is_set():
@@ -997,7 +1154,7 @@ async def _process_url(
                 url=url, status=STATUS_REVIEW, key=key,
                 comment_used=comment, comment_link=url,
                 error_detail="Page closed truoc khi dien form",
-                group_name=group_name,
+                group_name=group_name, host=_host,
             ))
             return STATUS_REVIEW
 
@@ -1088,7 +1245,7 @@ async def _process_url(
                 url=url, status=STATUS_FORM_ERROR, key=key,
                 comment_used=comment, comment_link=url,
                 error_detail="Khong dien duoc email — skip URL",
-                group_name=group_name,
+                group_name=group_name, host=_host,
             ))
             return STATUS_FORM_ERROR
 
@@ -1098,7 +1255,7 @@ async def _process_url(
                 url=url, status=STATUS_NO_FORM, key=key,
                 comment_used=comment, comment_link=url,
                 error_detail="Khong tim thay textarea comment",
-                group_name=group_name,
+                group_name=group_name, host=_host,
             ))
             return STATUS_NO_FORM
 
@@ -1109,7 +1266,7 @@ async def _process_url(
                 url=url, status=STATUS_FORM_ERROR, key=key,
                 comment_used=comment, comment_link=url,
                 error_detail=f"Fill comment loi: {exc}",
-                group_name=group_name,
+                group_name=group_name, host=_host,
             ))
             return STATUS_FORM_ERROR
 
@@ -1121,7 +1278,7 @@ async def _process_url(
                     url=url, status=STATUS_FORM_ERROR, key=key,
                     comment_used=comment, comment_link=url,
                     error_detail=f"Comment khong ghi vao textarea (len={len(val) if val else 0})",
-                    group_name=group_name,
+                    group_name=group_name, host=_host,
                 ))
                 return STATUS_FORM_ERROR
         except Exception:
@@ -1133,7 +1290,7 @@ async def _process_url(
                 url=url, status=STATUS_NO_FORM, key=key,
                 comment_used=comment, comment_link=url,
                 error_detail="Khong tim thay nut submit",
-                group_name=group_name,
+                group_name=group_name, host=_host,
             ))
             return STATUS_NO_FORM
 
@@ -1142,7 +1299,7 @@ async def _process_url(
                 url=url, status=STATUS_REVIEW, key=key,
                 comment_used=comment, comment_link=url,
                 error_detail="Page closed truoc khi submit",
-                group_name=group_name,
+                group_name=group_name, host=_host,
             ))
             return STATUS_REVIEW
 
@@ -1165,7 +1322,7 @@ async def _process_url(
                         url=url, status=STATUS_REVIEW, key=key,
                         comment_used=comment, comment_link=url,
                         error_detail=f"Click submit bi overlay chan: {exc2}",
-                        group_name=group_name,
+                        group_name=group_name, host=_host,
                     ))
                     return STATUS_REVIEW
             else:
@@ -1174,7 +1331,7 @@ async def _process_url(
                     url=url, status=STATUS_REVIEW, key=key,
                     comment_used=comment, comment_link=url,
                     error_detail=f"Click submit loi: {exc}",
-                    group_name=group_name,
+                    group_name=group_name, host=_host,
                 ))
                 return STATUS_REVIEW
 
@@ -1212,7 +1369,7 @@ async def _process_url(
                     url=url, status=STATUS_REVIEW, key=key,
                     comment_used=comment, comment_link=url,
                     error_detail="Page closed before response could be read",
-                    group_name=group_name,
+                    group_name=group_name, host=_host,
                 ))
                 return STATUS_REVIEW
 
@@ -1251,7 +1408,7 @@ async def _process_url(
             comment_link=comment_link,
             strategy=form_result.strategy,
             key=key,
-            group_name=group_name,
+            group_name=group_name, host=_host,
         ))
         return final_status
 
@@ -1261,7 +1418,7 @@ async def _process_url(
             url=url, status=STATUS_REVIEW, key=key,
             comment_used=comment, comment_link=url,
             error_detail="TargetClosedError: browser/context da bi dong",
-            group_name=group_name,
+            group_name=group_name, host=_host,
         ))
         return STATUS_REVIEW
     except Exception as exc:
@@ -1270,7 +1427,7 @@ async def _process_url(
             url=url, status=STATUS_REVIEW, key=key,
             comment_used=comment, comment_link=url,
             error_detail=str(exc),
-            group_name=group_name,
+            group_name=group_name, host=_host,
         ))
         return STATUS_REVIEW
     finally:
@@ -1312,12 +1469,21 @@ async def _run_async(
     stop_event: asyncio.Event,
     bypass_name: bool = False,
     group_name: str = "",
+    proxies: list[str] | None = None,
+    proxy_rotate_every: int = 250,
 ) -> None:
     """Coroutine chinh: khoi browser, chay worker loops song song.
     Co watchdog: neu 5 phut khong co URL nao hoan thanh → huy worker,
     phuc hoi URL dang treo, khoi dong lai worker moi (khong reset tu dau).
     """
     loop = asyncio.get_event_loop()
+
+    # Proxy pool (None neu khong co proxy)
+    proxy_pool: ProxyPool | None = None
+    if proxies:
+        proxy_pool = ProxyPool(proxies, workers_per_batch=max_workers, rotate_every=proxy_rotate_every)
+        log.info(f"[PROXY] {proxy_pool._n} proxies loaded, rotate moi {proxy_rotate_every} success")
+        log.info(f"[PROXY] Initial batch: {proxy_pool.current_batch_info()}")
 
     WATCHDOG_TIMEOUT = 180   # 3 phut khong co ket qua → restart (voi _URL_TIMEOUT=60s, 3 URL fail lien tiep = signal)
     WATCHDOG_CHECK   = 20    # kiem tra moi 20 giay
@@ -1373,6 +1539,8 @@ async def _run_async(
                     watchdog_triggered = asyncio.Event()
 
                     # ── Worker loop ─────────────────────────────────────────
+                    _worker_errors: dict[int, int] = {}  # dem loi lien tiep moi worker (proxy failover)
+
                     async def worker_loop(wid: int, _lrt=last_result_time, _wt=watchdog_triggered) -> None:
                         empty_retries = 0
                         MAX_EMPTY_RETRIES = 25
@@ -1388,27 +1556,41 @@ async def _run_async(
                             empty_retries = 0
                             url, comment, key = job
                             profile = scheduler.get_profile(key)
+                            # Lay proxy cho worker nay
+                            wp = proxy_pool.get_proxy(wid) if proxy_pool else None
                             try:
                                 final_status = await asyncio.wait_for(
-                                    _process_url(url, comment, key, profile, browser, result_queue, loop, headless, stop_event=stop_event, bypass_name=bypass_name, worker_id=wid, group_name=group_name),
+                                    _process_url(url, comment, key, profile, browser, result_queue, loop, headless, stop_event=stop_event, bypass_name=bypass_name, worker_id=wid, group_name=group_name, proxy=wp),
                                     timeout=_URL_TIMEOUT,
                                 )
                             except (asyncio.TimeoutError, Exception) as exc:
                                 label = "timeout" if isinstance(exc, asyncio.TimeoutError) else "unhandled"
                                 await _force_close_context(wid, label)
-                                result_queue.put(Result(url=url, status=STATUS_REVIEW, key=key, comment_used=comment, error_detail=f"Worker error: {exc}", group_name=group_name))
+                                result_queue.put(Result(url=url, status=STATUS_REVIEW, key=key, comment_used=comment, error_detail=f"Worker error: {exc}", group_name=group_name, host=profile.host))
                                 scheduler.return_comment(key, comment)
                                 scheduler.finalize_job(url)
                                 _lrt[0] = time.monotonic()
+                                # Proxy failover: 5 loi lien tiep → skip proxy
+                                _worker_errors[wid] = _worker_errors.get(wid, 0) + 1
+                                if _worker_errors.get(wid, 0) >= 5 and proxy_pool:
+                                    proxy_pool.skip_proxy(wid)
+                                    _worker_errors[wid] = 0
                                 continue
 
                             if final_status in (STATUS_SUCCESS, STATUS_MODERATION):
                                 scheduler.record_success(key, comment)
+                                scheduler.finalize_job(url, success=True)
+                                _worker_errors[wid] = 0  # reset error count
+                                # Proxy rotation check
+                                if proxy_pool and proxy_pool.on_success():
+                                    log.info(f"[PROXY] Da dat {proxy_pool.rotate_every} success — rotate batch + restart browser")
+                                    _wt.set()
+                                # Chỉ tăng progress bar khi success thật — _total_jobs = sum(targets)
+                                result_queue.put(Result(status=STATUS_PROGRESS, key=key, group_name=group_name))
                             else:
                                 scheduler.return_comment(key, comment)
-                            scheduler.finalize_job(url)
+                                scheduler.finalize_job(url, success=False)
                             _lrt[0] = time.monotonic()
-                            result_queue.put(Result(status=STATUS_PROGRESS, key=key, group_name=group_name))
 
                             async with _restart_lock:
                                 _urls_since_restart[0] += 1
@@ -1479,11 +1661,15 @@ def run_session(
     stop_event_holder: list | None = None,
     bypass_name: bool = False,
     group_name: str = "",
+    proxies: list[str] | None = None,
+    proxy_rotate_every: int = 250,
 ) -> None:
     """
     Entry point cho background thread.
     scheduler: JobScheduler chua tat ca (url, comment, key) triplets va per-key profiles.
     stop_event_holder: list de GUI co the set stop event.
+    proxies: danh sach proxy strings (host:port hoac user:pass@host:port).
+    proxy_rotate_every: rotate batch proxy sau moi N success.
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -1507,7 +1693,8 @@ def run_session(
 
     try:
         loop.run_until_complete(
-            _run_async(scheduler, result_queue, max_workers, headless, stop_event, bypass_name, group_name)
+            _run_async(scheduler, result_queue, max_workers, headless, stop_event, bypass_name, group_name,
+                       proxies=proxies, proxy_rotate_every=proxy_rotate_every)
         )
     finally:
         loop.close()

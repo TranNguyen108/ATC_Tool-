@@ -186,13 +186,34 @@ async def _extract_fields(page: Page, form: Locator) -> dict:
         "input[value*='submit' i]",
         "button",  # fallback
     ]
+    # Selector dùng cho fallback page-level (bỏ "button" quá rộng)
+    submit_sels_page = [
+        "input[type='submit']",
+        "button[type='submit']",
+        "button:has-text('Post Comment')",
+        "button:has-text('Submit')",
+        "button:has-text('Comment')",
+        "button:has-text('Send')",
+        "button:has-text('Đăng')",
+        "button:has-text('Gửi')",
+        "button:has-text('Bình luận')",
+        "input[value*='comment' i]",
+        "input[value*='submit' i]",
+    ]
+
+    submit_field = await _find_field_in_form(form, submit_sels)
+    if submit_field is None:
+        # Fallback: nút submit có thể nằm ngoài thẻ <form> (sibling element)
+        submit_field = await _find_field_in_form(page, submit_sels_page)
+        if submit_field is not None:
+            log.debug("submit found outside <form> via page-level fallback")
 
     return {
         "name":    await _find_field_in_form(form, name_sels),
         "email":   await _find_field_in_form(form, email_sels),
         "url":     await _find_field_in_form(form, url_sels),
         "comment": await _find_field_in_form(form, comment_sels),
-        "submit":  await _find_field_in_form(form, submit_sels),
+        "submit":  submit_field,
     }
 
 
